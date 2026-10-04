@@ -183,3 +183,47 @@ export class CFrameResolver {
 		return bases;
 	}
 }
+
+
+/** The frame pointer chain of the C frames on the stack, as far as it is
+ * plausible: each frame saves the caller's frame pointer at (fp+0) and has
+ * its return address at (fp+2). A link is accepted if the frame pointers
+ * increase, stay below the top of the stack, and the return address follows
+ * a CALL (or is a trampoline return, see bankedcalls.ts). The chain ends at
+ * the first link that fails.
+ * @param fp The frame pointer register (IX, or IY).
+ * @param sp The stack pointer.
+ * @param top The end (exclusive) of the stack.
+ * @param read Reads memory (64k address).
+ * @param isTrampolineReturn True for a banked call trampoline's return address.
+ * @param maxLinks The maximum number of links.
+ * @returns The addresses of the return address slots and the span
+ * [start, end) of the chain, or undefined if there is no chain.
+ */
+export async function framePointerChain(fp: number, sp: number, top: number, read: (addr64k: number, size: number) => Promise<Uint8Array>,
+	isTrampolineReturn: (addr64k: number) => boolean, maxLinks = 100): Promise<{slots: Set<number>, start: number, end: number} | undefined> {
+	const slots = new Set<number>();
+	let start: number | undefined;
+	let prev = sp - 1;
+	for (let k = 0; k < maxLinks; k++) {
+		if (fp <= prev || fp + 4 > top)
+			break;
+		const link = await read(fp, 4);
+		const saved = link[0] | (link[1] << 8);
+		const ret = link[2] | (link[3] << 8);
+		let plausible = isTrampolineReturn(ret);
+		if (!plausible) {
+			const before = await read((ret - 3) & 0xFFFF, 3);
+			plausible = before[0] === 0xCD || (before[0] & 0b11000111) === 0b11000100;	// CALL nn, CALL cc,nn
+		}
+		if (!plausible)
+			break;
+		start ??= fp;
+		slots.add(fp + 2);
+		prev = fp;
+		fp = saved;
+	}
+	if (start === undefined)
+		return undefined;
+	return {slots, start, end: prev + 4};
+}

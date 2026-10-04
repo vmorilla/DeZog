@@ -1239,7 +1239,10 @@ hl: 0x${HexFormat.getHexString(resp.hl, 4)}`;
 								// Something has been popped. This is to exclude unexecuted RET cc.
 								const bytes = await this.readMemoryDump(prevPc, 2);
 								const opcodes = bytes[0] + (bytes[1] << 8);
-								if (this.isRet(opcodes)) {
+								// A return into a banked call trampoline (e.g. z88dk banked_call) is
+								// not the caller yet: continue until the trampoline returns
+								const banked = await this.getBankedCalls();
+								if (this.isRet(opcodes) && !banked?.isTrampolineReturn(Z80Registers.getPC())) {
 									// Stop here
 									condition = '';
 									correctedBreakNumber = BREAK_REASON_NUMBER.NO_REASON;

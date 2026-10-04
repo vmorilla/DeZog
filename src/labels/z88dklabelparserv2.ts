@@ -9,6 +9,7 @@ import {AsmConfigBase, Z88dkConfig} from '../settings/settings';
 import {UnifiedPath} from '../misc/unifiedpath';
 import {CDBINFO_PREFIX, C_LINE_PREFIX, Z88dkLineInfo, Z88dkMapSymbol, isDebugSymbol, parseLineLocation, parseMapLine, stripDebugFileName} from './z88dkmapfile';
 import {CSymbolTable} from './csymboltable';
+import {BankedCallConvention, detectBankedCallConvention} from '../remotes/bankedcalls';
 
 /** The C source file of a .lis file. */
 interface ListCFile {
@@ -216,6 +217,13 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 	/// Built once per map file, after the .lis file has been parsed.
 	public cSymbols: CSymbolTable | undefined;
 
+	/// Called with the banked call convention found in the map file (set by
+	/// the owner, see LabelsClass), e.g. z88dk zxn's banked_call.
+	public setBankedCalls: ((convention: BankedCallConvention) => void) | undefined;
+
+	/// The map files already searched for a banked call convention.
+	protected bankedCallsMapFiles = new Set<string>();
+
 	// z88dk: The format is line-number address opcode.
 	// Used to remove the line number.
 	protected z88dkRegEx = /^\s*\d+\s+/;
@@ -341,6 +349,7 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 			this.currentListCFile = undefined;
 			super.loadAsmListFile(config);
 			this.loadCSymbols(mapFile);
+			this.detectBankedCalls(mapFile);
 
 			// Check for "topOfStack" (for z88dk C-compiler)
 			const __register_sp = this.z88dkMappings.get('__register_sp');
@@ -853,6 +862,26 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 			if (sym.type !== 'const')
 				this.addressSymbols.push(sym);
 		}
+	}
+
+
+	/** Looks for a banked call convention in the map file's symbols
+	 * (e.g. z88dk zxn's banked_call) and passes it to the owner.
+	 */
+	protected detectBankedCalls(mapFile: string) {
+		if (!this.setBankedCalls || this.bankedCallsMapFiles.has(mapFile))
+			return;
+		this.bankedCallsMapFiles.add(mapFile);
+		const convention = detectBankedCallConvention({
+			getSymbol: (name: string, module?: string) => {
+				const sym = module
+					? (this.z88dkLocalMappings.get(module + ':' + name) ?? this.allMapSymbols.find(s => s.name === name && s.module === module))
+					: (this.allMapSymbols.find(s => s.name === name && s.scope === 'public') ?? this.allMapSymbols.find(s => s.name === name));
+				return sym?.value;
+			}
+		});
+		if (convention)
+			this.setBankedCalls(convention);
 	}
 
 

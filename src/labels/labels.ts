@@ -11,6 +11,7 @@ import {ReverseEngineeringLabelParser} from './reverseengineeringlabelparser';
 import {SettingsParameters} from '../settings/settings';
 import {Issue, LabelParserBase} from './labelparserbase';
 import {CSymbolTable} from './csymboltable';
+import {BankedCallConvention} from '../remotes/bankedcalls';
 import * as fs from 'fs';
 import * as fglob from 'fast-glob';
 
@@ -109,6 +110,10 @@ export class LabelsClass {
 	/// True if C names are resolved (launch.json "cDebug.enabled"). Set by the debug adapter.
 	public cNamesEnabled = true;
 
+	/// The banked call convention of the program (e.g. z88dk zxn's
+	/// banked_call), used for the call stack and stepping. Undefined if none.
+	public bankedCalls: BankedCallConvention | undefined;
+
 
 	/// Map with a key with a label that contains other maps recursively.
 	/// I.e. a dotted label like 'a.b.c.d' can be referenced through
@@ -166,6 +171,7 @@ export class LabelsClass {
 	 */
 	protected init(smallValuesMaximum: number) {
 		this.cSymbols.clear();
+		this.bankedCalls = undefined;
 		// clear data
 		this.fileLineNrs.clear();
 		this.lineArrays.clear();
@@ -247,6 +253,7 @@ export class LabelsClass {
 		if (mainConfig.z88dkv2) {
 			const parser = new Z88dkLabelParserV2(memoryModel, this.fileLineNrs, this.lineArrays, this.labelsForNumber64k, this.labelsForLongAddress, this.numberForLabel, this.labelLocations, this.watchPointLines, this.assertionLines, this.logPointLines, issueHandler);
 			parser.cSymbols = this.cSymbols;
+			parser.setBankedCalls = (convention) => this.bankedCalls ??= convention;
 			for (const config of mainConfig.z88dkv2) {
 				this.loadAsmListFile(parser, config);
 			}

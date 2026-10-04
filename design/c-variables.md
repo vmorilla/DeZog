@@ -325,3 +325,154 @@ Phase 1 was widened slightly so that it is useful on its own. Besides the symbol
 - **Checked live** in jnext on the probe, in `sum_points` (nested blocks, register locals) and against globals; see the session notes.
 
 Not done: logpoint `${…}` and breakpoint conditions with C names (they still use labels, i.e. addresses), casts, `sizeof`, comparisons, and floats in arithmetic.
+
+## 12. Plan: logpoints, assertions and the banked call stack
+
+Status: **plan, not implemented**. Written 2026-10-04 after phase 4. The findings below were checked against the code of this branch and the sample project's build (z88dk v26256, `+zxn`, `-clib=sdcc_iy`).
+
+| Part | What | Depends on |
+|---|---|---|
+| A | Groundwork: a shared C expression service, and comparisons/logic in the grammar | — |
+| B | C names in logpoints (`${n}`, `${player.pos.x}`) | A |
+| C | C names in breakpoint conditions and `ASSERTION`s | A |
+| D | A correct call stack (and stepping) through `banked_call` | — (independent) |
+
+**Recommended order: D, A, B, C.**
+- D is a correctness problem visible in every session with banked code, and it may also cause step-over to run away (D.5).
+- B is the smallest of the C-name parts, and it proves the service from A before C makes conditions asynchronous.
+
+### 12.A Groundwork
+
+1. **A C expression service.** Move `resolveCExpression` and its context (locals through the frame resolver, statics, globals) out of `debugadapter.ts` into `src/variables/cexprservice.ts`. It gets the call stack, a frame index, and the remote access (memory, registers, paging). WATCH and hover keep using it unchanged. Logpoints and conditions call it with a one-frame stack `[{addr: pc}]`, because they're evaluated at their own address.
+2. **Grammar** (`cexpr.ts`): add, with C precedence and results 0/1:
+   - comparisons `== != < > <= >=`;
+   - logic `&& || !`, with `&&`/`||` short-circuiting so `p != 0 && p->x > 3` doesn't read through a null pointer;
+   - bitwise `& | ^ ~ << >>` (binary `&` is told apart from unary `&` by position).
+3. **One rule for "is this C?",** shared by every user: it parses as C, uses at least one name, every name is a C variable, and no name starts with `_`. Otherwise the existing label evaluation is used, unchanged, as WATCH does today.
+4. **Tests:** grammar and precedence, short-circuit (no memory read past a false `&&`), the shared rule.
+
+### 12.B C names in logpoints
+
+**Today** (`src/misc/logeval.ts`):
+- A logpoint message is prepared **once, when the logpoint is created**. `replaceLabels` turns every name into a fixed 64K address, `b@(…)`/`w@(…)` read memory when it fires, and registers give their values.
+- A C local has no fixed address (it depends on the frame), so `${n}` can't work this way.
+- Source logpoints in C (`// LOGPOINT [group] …`) already work through `--c-code-in-asm`.
+
+**Design:**
+1. **Pass the address to `LogEval`.** Logpoints from the source know it (`InstrumentationParser`); for VS Code logpoints it's the breakpoint's long address (`debugadapter.ts`, where `new LogEval(bp.logMessage, …)` is created). It gives the context: the function's visible locals and statics.
+2. **Decide when preparing.** A `${…}` whose expression (without `:format`) is C by rule A.3 is kept as text and marked "C". Everything else is prepared as today.
+3. **Evaluate when it fires.** A C segment is evaluated through the service (A.1) at the logpoint's address. The result is formatted like WATCH (`{x=10, y=20}`, `"HERO"`, `65 'A'`), or with an explicit `:format` (`hex8`, `int16`, …) applied to its numeric value.
+4. **Errors** are printed in place (`n=<frame not found>`), so the rest of the message still appears.
+
+**Tests:**
+- Unit: `LogEval` with a fake remote, covering mixed C and legacy segments, formats and errors.
+- Live: the harness with a logpoint `n=${n} my_var=${my_var}` on `factorial`, expecting one line per call: `n=5 … n=1`.
+
+### 12.C C names in conditions and ASSERTIONs
+
+**Today:**
+- An `ASSERTION expr` comment becomes a breakpoint with the condition `!(expr)` (`InstrumentationParser.createAssertions`, `Expressions.getAssertionFromCondition`).
+- Conditions, from assertions and from VS Code's breakpoint condition field, are evaluated **synchronously** with `Expressions.evalExpression`: labels are addresses, registers are values, and **memory can't be read**. The code says so: "If I would allow 'await evalExpression' I could also allow e.g. memory checks".
+- They're evaluated in `DzrpRemote.checkConditionAndLog`, called from an asynchronous handler that already awaits the logpoint evaluation (`dzrpremote.ts`, around line 1002), and in `ZSimRemote`, inside the synchronous CPU loop.
+
+**Design:**
+1. **`checkConditionAndLog` becomes asynchronous.** A C condition (rule A.3) is evaluated through the service at the breakpoint's address. Legacy conditions are evaluated as today.
+2. **DZRP remotes first** (cspect, dzrp, zxnext): their caller is already asynchronous.
+3. **zsim later** (decision 2026-10-04), not in the same change: its check runs inside the CPU loop. For a breakpoint with a C condition, zsim stops, the condition is evaluated asynchronously, and execution continues automatically if it's false. Legacy conditions stay in the loop. The alternative, a synchronous evaluator over zsim's local memory, would duplicate the evaluator.
+4. **Reason text** for a failed C assertion shows the values of the names, e.g. `Assertion failed: n > 0 (n = -1)`. The legacy `replaceVarsWithValues` would show addresses for C names.
+5. **Source assertions in C:** `// ASSERTION n > 0` on a code line, through `--c-code-in-asm` like logpoints.
+
+**Cost:** every hit of a C-conditioned breakpoint costs a few DZRP round trips (frame base, values). That's fine for normal use, but slow for a breakpoint hit thousands of times; the user guide should say so.
+
+**Tests:**
+- Unit: conditions, with `!(…)` wrapping and short-circuit.
+- Live: a breakpoint on `factorial` with the condition `n == 2` stops once, with `n = 2`. An `// ASSERTION n > 1` stops when `n` reaches 1, with the reason text.
+
+### 12.D The call stack through `banked_call`
+
+**How z88dk's `banked_call` works** (`+zxn`, module `zxn_banked_call`; disassembled from the sample's NEX):
+
+```
+caller:      call banked_call          ; return address R points to the defq
+             defq target               ; target address (2), bank (1), 0
+             ...                       ; execution continues here: R + 4
+banked_call: di
+             pop  hl                   ; HL = R
+             ld   (mainsp),sp
+             ld   sp,(tempsp)          ; switch to the banked stack
+             ld   a,(cur_bank) / push af        ; save the previous bank
+             ld   e,(hl) ... a,(hl) ... hl += 4  ; DE = target, A = bank, HL = R + 4
+             push hl                   ; the real return address, on the BANKED stack
+             ld   (tempsp),sp / ld sp,(mainsp)  ; back to the main stack
+             ld   (cur_bank),a / call page_in   ; NEXTREG $50/$51 (banking_mmu_low/high)
+             ei / ex de,hl
+             call l_jphl               ; jp (hl): calls the target; pushes the return
+                                       ; address banked_call+$29 on the MAIN stack
+             ... back on the banked stack: pop the real return address and the bank,
+             push the return address on the main stack, restore the bank, ret
+_initbankedsp: ld (tempsp),sp / ld hl,-100 / add hl,sp / ld sp,hl
+                                       ; the banked stack = the 100 bytes below the
+                                       ; initial SP; the main stack starts below it
+```
+
+**Why the call stack is wrong today** (`RemoteBase.getCallStackFromEmulator`, `getStackEntryType`):
+- **No caller frame:** during a banked function, the main stack holds only `banked_call+$29`, the return address after `call l_jphl`. The caller's real return address (R + 4) is on the banked stack, so the caller's call site doesn't appear.
+- **Misnamed frames:** that return address is preceded by `call l_jphl`, so DeZog creates a frame named after the called address, `8EE4h` (`l_jphl`), located inside `banked_call`. It also names a frame after `_main` with an address inside `banked_call`.
+- **Garbage frames:** the stack scan runs from SP to `topOfStack` and so includes the banked stack, whose words (return addresses, saved banks, stale data) can be mistaken for return addresses (`8EE5h`).
+- **Wrong line:** the outer `factorial` frame gets the function's first address, so it shows line 7 instead of line 14.
+- **What's unaffected:** C locals in outer frames are correct regardless, because the IX chain doesn't depend on these frames.
+
+**Design:**
+0. **Room for other architectures** (decision 2026-10-04: ZX Next first). A banked-call convention is an interface, and z88dk's `+zxn` `banked_call` is its first implementation. A convention:
+   - detects itself from the map's symbols, so each one declares the symbols it needs;
+   - verifies the code at run time against its signature;
+   - recognises its trampoline return addresses on the main stack;
+   - reads its records of active banked calls (target, real return address, the caller's banking);
+   - gives the end of the main stack, if it keeps its own stack there;
+   - gives the length of its call sequence, for step over (7 bytes for `call banked_call` + `defq`).
+
+   The call-stack and stepping code only uses the interface. Further conventions, e.g. classic `+zx` 128K banking, are added as new implementations.
+1. **Detect** z88dk's `zxn` `banked_call` from the map, not from fixed addresses:
+   - `banked_call`, plus the local symbols `tempsp`, `mainsp` and `cur_bank` of module `zxn_banked_call`, and `l_jphl`;
+   - the constants `banking_mmu_low`/`banking_mmu_high`, which give the banked slots.
+
+   Verify the code at `banked_call` against the signature above (`F3 E1 ED 73 … ED 7B …`), and get the trampoline return address (`banked_call+$29`) and the banked stack size (the `ld hl,-N` in `_initbankedsp`) from the code. Unknown code (another z88dk version or target) means no special handling. Other targets (classic `+zx` 128K banking) can be added as further signatures.
+2. **Read the banked stack** at each stop: from `(tempsp)`, entries of 4 bytes, innermost first: the real return address, then the saved bank (pushed as AF, so A, the bank, is the upper byte). Each `banked_call+$29` value on the main stack, from SP upwards, corresponds to the next entry. No end marker is needed.
+3. **Rebuild the frames:** each trampoline return becomes a frame with:
+   - name: the function at the `defq` target (long address from address and bank, then the C name);
+   - caller address: R − 3, the `call banked_call` instruction, as a long address with the caller's bank, which is the saved bank of the entry when the address is in a banked slot.
+
+   No frame is created for `l_jphl` or inside `banked_call`.
+4. **Limit the scan** to the main stack: below the banked stack, i.e. below (SP at `_initbankedsp`) − N. That SP is the startup code's stack pointer when it runs `_initbankedsp`, just before calling `main`. It's normally `__register_sp` (to be verified), otherwise the value `tempsp` has when no banked call is active. This also suggests recommending `topOfStack: "__register_sp"`. The sample project's launch.json has `0xFF58`, which isn't its stack top (`__register_sp = $BFF0`).
+5. **Stepping, to verify first:**
+   - **Step over:** `RemoteBase.calcStepBp` places the step-over breakpoint at `pc + opcode.length`, which is `pc + 3` for `call banked_call`, on the `defq` bytes that never execute. So stepping over a banked call probably runs away. Fix: treat `call banked_call` as a 7-byte instruction, as `RST $08` already gets an adjusted length for esxDOS. Let the disassembly show the 4 bytes as `defq` data.
+   - **Step out:** stepping out of a banked function returns into `banked_call`. It should stop at R + 4 in the caller instead.
+6. **Reverse debugging** (`cpuhistory.ts` builds its own call stack): later, with the same trampoline knowledge.
+
+**Tests:**
+- Unit: a synthetic memory image (code bytes with the signature, main stack, banked stack) for 1, 2 and 3 nested banked calls, including recursion and a non-banked caller (`main`). Unknown code must give the old behaviour.
+- Live: the sample's `factorial` at the third recursion level should give `main → factorial (line 14) → factorial (line 14) → factorial`, with no `8EE4h` frames. `n` in each frame should be unchanged (5, 4, 3).
+- Stepping: step over `factorial(5)` in `main` stops on the next line; step out of `factorial` stops in its caller.
+
+### 12.D, as implemented
+
+- **The interface and the first convention:** `src/remotes/bankedcalls.ts` holds `BankedCallConvention`, the registry `BANKED_CALL_CONVENTIONS`, and `Z88dkZxnBankedCall`.
+  - The z88dk v2 parser detects a convention from the map once per map file; `Labels.bankedCalls` holds it.
+  - The convention verifies `banked_call` against the signature at run time, retrying until it matches (the program may not be loaded yet). It takes the trampoline return and the banked stack size from the code.
+  - Confirmed live in the sample: `tempsp` is `__register_sp` (`$BFF0`) when no banked call is active, and `$BFE4` (3 records) at the third recursion level.
+- **Call stack** (`RemoteBase.getCallStackFromEmulator`):
+  - The stack scan stops at the main stack's top (`__register_sp − 100`).
+  - Each trampoline return becomes a frame for the called function, at its real call site, in the caller's bank.
+- **The frame pointer chain** (`framePointerChain`, `cframes.ts`) was added as well; the plan didn't foresee it. Small integers on the stack can look like return addresses: the argument 3 of `factorial(n − 1)` follows a `CALL` at `$0000` in page 20. That produced a spurious frame, which also shifted the C locals.
+  - Within the span of the validated IX chain, only its return address slots (IX+2) are taken as return addresses; outside it, the old heuristic applies.
+  - Only used for programs with C debug information.
+- **Step over** (`calcStepBp`): a `call banked_call` + `defq` counts as 7 bytes. Confirmed: before the change, stepping over `factorial(5)` in `main` ran away; now it stops on the next line.
+- **Step out** (`DzrpRemote.stepOut`): a `ret` into the trampoline doesn't stop. Confirmed: before the change, stepping out of `factorial(1)` stopped inside `banked_call`; now it stops in `factorial(2)` right after the call (`$15002B`).
+- **Live result** (jnext, sample, `factorial` at the third recursion level): `main` (line 14) → `factorial` → `factorial` → `factorial` (line 15), with `n` = 5, 4, 3 and no `8EE4h` frames.
+- **Not done:** zsim's own step out (`ZSimRemote`), reverse debugging's call stack (`cpuhistory.ts`), the disassembly of the `defq` as data, and step into a banked call (it steps into `banked_call`).
+
+### 12.E Decisions (2026-10-04)
+
+1. C conditions in zsim come later (12.C.3).
+2. D targets z88dk's `+zxn` `banked_call` first, behind an interface that leaves room for other architectures (12.D.0).
+3. No colon form for `LOGPOINT:`/`ASSERTION:`: it was a typo; the existing syntax stays.

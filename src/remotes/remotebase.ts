@@ -12,6 +12,8 @@ import {BaseMemory} from '../disassembler/core/basememory';
 import {Opcode, OpcodeFlag} from '../disassembler/core/opcode';
 import {Disassembly, DisassemblyClass} from '../disassembler/disassembly';
 import {MemoryBank, MemoryModel} from './MemoryModel/memorymodel';
+import {BankedCallConvention, BankedCallRuntime, assignBankedCalls} from './bankedcalls';
+import {framePointerChain} from '../variables/cframes';
 import {LogEval} from '../misc/logeval';
 import {InstrumentationParser} from './instrumentationparser';
 
@@ -635,11 +637,10 @@ export class RemoteBase extends EventEmitter {
 	* The values are returned as hex string, an additional info might follow.
 	* This is e.g. used for the ZEsarUX extended stack info.
 	*/
-	public async getStackFromEmulator(): Promise<Array<string>> {
+	public async getStackFromEmulator(tos = this.topOfStack): Promise<Array<string>> {
 		//await this.getRegisters();
 		const sp = Z80Registers.getSP();
 		// calculate the depth of the call stack
-		const tos = this.topOfStack;
 		let depth = tos - sp; // 2 bytes per word
 		if (depth > 2 * RemoteBase.MAX_STACK_ITEMS)
 			depth = 2 * RemoteBase.MAX_STACK_ITEMS;
@@ -684,8 +685,14 @@ export class RemoteBase extends EventEmitter {
 	 */
 	public async getCallStackFromEmulator(): Promise<void> {
 		const callStack = new RefList<CallStackFrame>();
+		// Banked calls (e.g. z88dk zxn banked_call) may keep data above the main stack
+		const banked = await this.getBankedCalls();
+		let tos = this.topOfStack;
+		const mainTop = banked?.getMainStackTop();
+		if (mainTop !== undefined && mainTop < tos && mainTop > Z80Registers.getSP())
+			tos = mainTop;
 		// Get normal stack values
-		const stack = await this.getStackFromEmulator();	// Returns 64k addresses as hex string.
+		const stack = await this.getStackFromEmulator(tos);	// Returns 64k addresses as hex string.
 		// Read the memory for all different stack values at once
 		const compressedStack = [...new Set(stack)];
 		const stackMem = await this.readStackEntriesMemory(compressedStack);
@@ -693,8 +700,24 @@ export class RemoteBase extends EventEmitter {
 		const sp = Z80Registers.getRegValue(Z80_REG.SP);
 		const len = stack.length;
 		const top = sp + 2 * len;
-		let lastCallStackFrame = new CallStackFrame(0, top - 2, this.getMainName(top));
+		let lastCallStackFrame = new CallStackFrame(0, top - 2, this.getMainName(top, tos));
+		// C frames: inside the span of the frame pointer chain only its return
+		// address slots are return addresses (the rest is arguments and locals)
+		const chain = await this.getFramePointerChain(sp, top, banked);
 		callStack.addObject(lastCallStackFrame);
+
+		// Banked calls: the trampoline's return addresses on the stack stand for
+		// the called function, called from the real call site
+		const bankedCalls = new Map<number, {name: string, callerAddr: number}>();
+		if (banked) {
+			const values = stack.map(v => parseInt(v, 16));
+			const count = values.filter(v => banked.isTrampolineReturn(v)).length;
+			const calls = await banked.getActiveCalls(this.bankedCallRuntime(), count);
+			for (const [index, call] of assignBankedCalls(values, banked, calls)) {
+				const label = (call.targetAddr !== undefined) ? Labels.getLabelsForLongAddress(call.targetAddr)[0] : undefined;
+				bankedCalls.set(index, {name: label ?? 'banked call', callerAddr: call.callerAddr});
+			}
+		}
 
 		// Check for each value if it maybe is a CALL or RST
 		const stackCallerMap = new Map<string, {
@@ -712,7 +735,11 @@ export class RemoteBase extends EventEmitter {
 		// Now create the call stack with only CALLed addresses
 		for (let i = 0; i < len; i++) {
 			const stackValue = stack[i];
-			const type = stackCallerMap.get(stackValue);
+			const isTrampoline = banked?.isTrampolineReturn(parseInt(stackValue, 16));
+			const stackAddr = top - 2 - 2 * i;
+			const isData = chain && stackAddr >= chain.start && stackAddr < chain.end && !chain.slots.has(stackAddr);
+			// A trampoline return without a banked call record is not a call
+			const type = isData ? undefined : isTrampoline ? bankedCalls.get(i) : stackCallerMap.get(stackValue);
 			if (type) {
 				// Set caller address
 				lastCallStackFrame.addr = type.callerAddr;
@@ -733,6 +760,51 @@ export class RemoteBase extends EventEmitter {
 
 		// Return
 		this.listFrames = callStack;
+	}
+
+
+	/** The frame pointer chain of the C frames on the stack (sdcc: IX, or IY
+	 * with cDebug.framePointer 'iy'), see framePointerChain.
+	 * Only used for programs with C debug information.
+	 * @param sp The stack pointer.
+	 * @param top The end (exclusive) of the stack.
+	 * @param banked The banked call convention, if any.
+	 * @returns The addresses of the return address slots and the span
+	 * [start, end) of the chain, or undefined if there is no chain.
+	 */
+	protected async getFramePointerChain(sp: number, top: number, banked: BankedCallConvention | undefined): Promise<{slots: Set<number>, start: number, end: number} | undefined> {
+		if (!Labels.cSymbols.hasCdb())
+			return undefined;
+		const register = (Settings.launch?.cDebug?.framePointer === 'iy') ? 'IY' : 'IX';
+		return framePointerChain(this.getRegisterValue(register), sp, top,
+			(addr64k, size) => this.readMemoryDump(addr64k, size),
+			addr64k => banked?.isTrampolineReturn(addr64k) ?? false,
+			RemoteBase.MAX_STACK_ITEMS);
+	}
+
+
+	/** The banked call convention of the program if its code is verified,
+	 * otherwise undefined. */
+	protected async getBankedCalls(): Promise<BankedCallConvention | undefined> {
+		const convention = Labels.bankedCalls;
+		if (!convention)
+			return undefined;
+		try {
+			return (await convention.verify(this.bankedCallRuntime())) ? convention : undefined;
+		}
+		catch {
+			return undefined;
+		}
+	}
+
+
+	/** The machine access for the banked call convention. */
+	protected bankedCallRuntime(): BankedCallRuntime {
+		return {
+			read: (addr64k: number, size: number) => this.readMemoryDump(addr64k, size),
+			getSlots: () => this.getSlots(),
+			createLongAddress: (addr64k: number, slots?: number[]) => Z80Registers.createLongAddress(addr64k, slots)
+		};
 	}
 
 
@@ -762,10 +834,10 @@ export class RemoteBase extends EventEmitter {
 	 * @param sp The current SP value. 64k address.
 	 * @returns E.g. "__MAIN__" or "__MAIN-2__" if main is not at topOfStack.
 	 */
-	public getMainName(sp: number) {
+	public getMainName(sp: number, tos = this.topOfStack) {
 		let part = "";
-		if (this.topOfStack) {
-			const diff = this.topOfStack - sp;
+		if (tos) {
+			const diff = tos - sp;
 			if (diff != 0) {
 				if (diff > 0)
 					part = "+";
@@ -1513,6 +1585,13 @@ export class RemoteBase extends EventEmitter {
 		const ocFlags = opcode.flags;
 		let bpAddr1 = pc + opcode.length;
 		let bpAddr2;
+
+		// A banked call (e.g. "call banked_call / defq target") returns after its inline data
+		if (stepOver) {
+			const bankedLength = (await this.getBankedCalls())?.getCallLength(pc, opcodes);
+			if (bankedLength)
+				bpAddr1 = (pc + bankedLength) & 0xFFFF;
+		}
 
 		// Check for any skips (for RST)
 		const slots = this.getSlots();
