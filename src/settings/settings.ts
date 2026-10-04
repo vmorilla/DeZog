@@ -421,6 +421,23 @@ export interface SmartDisassemblerArgs {
 
 
 /**
+ * The settings for C debugging (z88dk/sdcc "-debug", see design/c-variables.md).
+ */
+export interface CDebugSettings {
+	/// false: no C scopes, no C names, plain label behavior.
+	enabled: boolean;
+	/// The frame pointer register. 'auto' detects it from the function prologue.
+	framePointer: 'auto' | 'ix' | 'iy';
+	/// Show or hide locals held in registers.
+	registerVariables: 'show' | 'hide';
+	/// Show C names ("factorial") or linker names ("_factorial") e.g. in the call stack.
+	cSymbolNames: 'c' | 'linker';
+	/// The format of float values: math32 (IEEE-754 single), math48 (6 bytes) or raw bytes.
+	floatFormat: 'math32' | 'math48' | 'raw';
+}
+
+
+/**
  * See also package.json.
  * The configuration parameters for the zesarux debugger.
  */
@@ -470,6 +487,9 @@ export interface SettingsParameters extends DebugProtocol.LaunchRequestArguments
 
 	/// These arguments are passed to the smart disassembler (disasm.list).
 	smartDisassemblerArgs: SmartDisassemblerArgs;
+
+	/// C debugging (z88dk/sdcc).
+	cDebug: CDebugSettings;
 
 	/// A directory for temporary files created by this debug adapter. E.g. ".tmp"
 	tmpDir: string;
@@ -571,6 +591,7 @@ export class Settings {
 				smallValuesMaximum: <any>undefined,
 				disassemblerArgs: <any>undefined,
 				smartDisassemblerArgs: <any>undefined,
+				cDebug: <any>undefined,
 				tmpDir: <any>undefined,
 				topOfStack: <any>undefined,
 				execAddress: <any>undefined,
@@ -1130,6 +1151,15 @@ export class Settings {
 		}
 		if (launchCfg.smartDisassemblerArgs.lowerCase === undefined)
 			launchCfg.smartDisassemblerArgs.lowerCase = false;
+
+		// C debugging
+		launchCfg.cDebug = {
+			enabled: launchCfg.cDebug?.enabled ?? true,
+			framePointer: launchCfg.cDebug?.framePointer ?? 'auto',
+			registerVariables: launchCfg.cDebug?.registerVariables ?? 'show',
+			cSymbolNames: launchCfg.cDebug?.cSymbolNames ?? 'c',
+			floatFormat: launchCfg.cDebug?.floatFormat ?? 'math32'
+		};
 
 		// Reverse debugging
 		if (launchCfg.history === undefined)

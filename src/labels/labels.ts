@@ -10,6 +10,7 @@ import {Z88dkLabelParserV2} from './z88dklabelparserv2';
 import {ReverseEngineeringLabelParser} from './reverseengineeringlabelparser';
 import {SettingsParameters} from '../settings/settings';
 import {Issue, LabelParserBase} from './labelparserbase';
+import {CSymbolTable} from './csymboltable';
 import * as fs from 'fs';
 import * as fglob from 'fast-glob';
 
@@ -101,6 +102,13 @@ export class LabelsClass {
 	/// Long addresses.
 	protected numberForLabel = new Map<string, number>();
 
+	/// The C view of a z88dk program (sdcc "-debug" CDB records), kept apart
+	/// from the assembler labels. Empty for other assemblers.
+	public cSymbols = new CSymbolTable();
+
+	/// True if C names are resolved (launch.json "cDebug.enabled"). Set by the debug adapter.
+	public cNamesEnabled = true;
+
 
 	/// Map with a key with a label that contains other maps recursively.
 	/// I.e. a dotted label like 'a.b.c.d' can be referenced through
@@ -157,6 +165,7 @@ export class LabelsClass {
 	 * @param smallValuesMaximum If smaller a label is not recognized as label.
 	 */
 	protected init(smallValuesMaximum: number) {
+		this.cSymbols.clear();
 		// clear data
 		this.fileLineNrs.clear();
 		this.lineArrays.clear();
@@ -237,6 +246,7 @@ export class LabelsClass {
 		// z88dkv2
 		if (mainConfig.z88dkv2) {
 			const parser = new Z88dkLabelParserV2(memoryModel, this.fileLineNrs, this.lineArrays, this.labelsForNumber64k, this.labelsForLongAddress, this.numberForLabel, this.labelLocations, this.watchPointLines, this.assertionLines, this.logPointLines, issueHandler);
+			parser.cSymbols = this.cSymbols;
 			for (const config of mainConfig.z88dkv2) {
 				this.loadAsmListFile(parser, config);
 			}
@@ -523,6 +533,48 @@ export class LabelsClass {
 			}
 		}
 		return names;
+	}
+
+
+	/** Resolves a C name of a variable with static storage (global, file
+	 * static or function static) in the C scope of the PC.
+	 * Names starting with '_' are left to the assembler labels.
+	 * @param name The C name, e.g. "player" or "::player".
+	 * @param longPc The context. Undefined: globals only.
+	 * @returns The long address or undefined.
+	 */
+	public getNumberForCName(name: string, longPc?: number): number | undefined {
+		if (!this.cNamesEnabled || name.startsWith('_'))
+			return undefined;
+		const v = this.cSymbols.resolveStatic(name, longPc);
+		if (v?.storage.kind === 'static')
+			return v.storage.longAddress;
+		return undefined;
+	}
+
+
+	/** The fallback for builds without CDB records: "name" is looked up as
+	 * the label "_name" if that is a public symbol of a C module.
+	 * @returns The long address or undefined.
+	 */
+	public getNumberForCFallback(name: string): number | undefined {
+		if (!this.cNamesEnabled || name.startsWith('_'))
+			return undefined;
+		const linkerName = this.cSymbols.fallbackLinkerName(name);
+		return linkerName ? this.getNumberForLabel(linkerName) : undefined;
+	}
+
+
+	/** Returns the name to display for a label: the C name for the linker
+	 * name of a C function or variable ("_factorial" -> "factorial") if
+	 * enabled, otherwise the label itself.
+	 * @param label The label (linker name).
+	 * @param useCNames false to keep the linker names.
+	 */
+	public getDisplayName(label: string, useCNames = true): string {
+		if (!this.cNamesEnabled || !useCNames)
+			return label;
+		return this.cSymbols.getCName(label) ?? label;
 	}
 
 

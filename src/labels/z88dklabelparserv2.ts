@@ -6,7 +6,8 @@ import {readFileSync} from 'fs';
 import {minimatch} from 'minimatch';
 import {AsmConfigBase, Z88dkConfig} from '../settings/settings';
 import {UnifiedPath} from '../misc/unifiedpath';
-import {C_LINE_PREFIX, Z88dkMapSymbol, isDebugSymbol, parseLineLocation, parseMapLine, stripDebugFileName} from './z88dkmapfile';
+import {CDBINFO_PREFIX, C_LINE_PREFIX, Z88dkMapSymbol, isDebugSymbol, parseLineLocation, parseMapLine, stripDebugFileName} from './z88dkmapfile';
+import {CSymbolTable} from './csymboltable';
 
 /**
  * This class parses z88dk asm list files.
@@ -172,6 +173,16 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 	/// Used to find the end of a C line.
 	protected addressSymbols: Z88dkMapSymbol[] = [];
 
+	/// The __CDBINFO__ symbols of the map file (sdcc "-debug": C types and variables).
+	protected cdbSymbols: Z88dkMapSymbol[] = [];
+
+	/// All non-debug symbols of the map file (public and local).
+	protected allMapSymbols: Z88dkMapSymbol[] = [];
+
+	/// The C symbol table to fill (set by the owner, see LabelsClass).
+	/// Built once per map file, after the .lis file has been parsed.
+	public cSymbols: CSymbolTable | undefined;
+
 	// z88dk: The format is line-number address opcode.
 	// Used to remove the line number.
 	protected z88dkRegEx = /^\s*\d+\s+/;
@@ -295,6 +306,7 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 			const mapFile: string = (config as Z88dkConfig).mapFile;
 			this.readmapFile(mapFile);
 			super.loadAsmListFile(config);
+			this.loadCSymbols(mapFile);
 
 			// Check for "topOfStack" (for z88dk C-compiler)
 			const __register_sp = this.z88dkMappings.get('__register_sp');
@@ -638,6 +650,8 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 		this.moduleCFiles.clear();
 		this.cLineSymbols = [];
 		this.addressSymbols = [];
+		this.cdbSymbols = [];
+		this.allMapSymbols = [];
 		Utility.assert(mapFile);	// mapFile is already absolute path.
 
 		// Iterate over map file
@@ -653,14 +667,63 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 					this.cLineSymbols.push(sym);
 				continue;
 			}
+			if (sym.name.startsWith(CDBINFO_PREFIX)) {
+				this.cdbSymbols.push(sym);
+				continue;
+			}
 			if (isDebugSymbol(sym.name))
-				continue;	// __ASM_LINE_ (the .lis file is more precise) and __CDBINFO__ (not used yet)
+				continue;	// __ASM_LINE_ (the .lis file is more precise)
 			this.z88dkMappings.set(sym.name, sym);
+			this.allMapSymbols.push(sym);
 			if (sym.scope === 'local' && sym.module)
 				this.z88dkLocalMappings.set(sym.module + ':' + sym.name, sym);
 			if (sym.type !== 'const')
 				this.addressSymbols.push(sym);
 		}
+	}
+
+
+	/** Builds the C symbol table from the map file (once per map file).
+	 * Needs the address conversion, i.e. is called after the .lis file has been parsed.
+	 */
+	protected loadCSymbols(mapFile: string) {
+		const table = this.cSymbols;
+		if (!table || table.isLoaded(mapFile))
+			return;
+		const publicSymbols = new Map<string, Z88dkMapSymbol>();
+		const localNames = new Map<string, string[]>();
+		for (const sym of this.allMapSymbols) {
+			if (sym.scope === 'public')
+				publicSymbols.set(sym.name, sym);
+		}
+		for (const sym of this.z88dkLocalMappings.values()) {
+			let names = localNames.get(sym.module);
+			if (!names) {
+				names = [];
+				localNames.set(sym.module, names);
+			}
+			names.push(sym.name);
+		}
+		// The C lines with their scope (sdcc: "file::x::level::block:line")
+		const cLines: Array<{longAddress: number, module: string, level: number, block: number}> = [];
+		for (const sym of this.cLineSymbols) {
+			const info = parseLineLocation(sym.location);
+			if (info?.level !== undefined && info.block !== undefined)
+				cLines.push({longAddress: this.funcConvertAddress(sym.value), module: sym.module, level: info.level, block: info.block});
+		}
+		table.load(mapFile, this.cdbSymbols, this.allMapSymbols, {
+			cLines,
+			getPublic: (name) => publicSymbols.get(name),
+			getLocal: (module, name) => this.z88dkLocalMappings.get(module + ':' + name),
+			getLocalNames: (module) => localNames.get(module) ?? [],
+			addressSymbols: this.addressSymbols,
+			toLongAddress: (value) => this.funcConvertAddress(value),
+			slotEnd: (longAddress) => {
+				const memModel = this.memoryModel;
+				const slot = memModel.slotRanges[memModel.slotAddress64kAssociation[longAddress & 0xFFFF]];
+				return (longAddress & ~0xFFFF) + slot.end + 1;
+			}
+		});
 	}
 
 

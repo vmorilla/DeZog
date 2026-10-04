@@ -76,8 +76,15 @@ export class Expressions {
 
 
 				if (isNaN(res)) {
-					// Check for "normal" label
-					res = Labels.getNumberForLabel(lbl);
+					// C name (z88dk/sdcc): wins over an assembler label of the same name
+					const cValue = Labels.getNumberForCName(lbl, Expressions.getContextPc());
+					if (cValue !== undefined)
+						res = cValue & 0xFFFF;
+				}
+
+				if (isNaN(res)) {
+					// Check for "normal" label, then the C fallback ("name" -> "_name")
+					res = Labels.getNumberForLabel(lbl) ?? Labels.getNumberForCFallback(lbl);
 					if (isNaN(res)) {
 						res = HexFormat.parseValue(lbl);
 						if (isNaN(res))
@@ -94,6 +101,17 @@ export class Expressions {
 
 		// Return the expression with variables replaced by numbers
 		return exprLabelled;
+	}
+
+
+	/** The context for C names: the long PC, or undefined if there is no remote. */
+	public static getContextPc(): number | undefined {
+		try {
+			return Remote?.getPCLong();
+		}
+		catch {
+			return undefined;	// No remote (e.g. unit tests)
+		}
 	}
 
 

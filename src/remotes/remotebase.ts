@@ -404,6 +404,7 @@ export class RemoteBase extends EventEmitter {
 	 */
 	public readListFiles(configuration: any) {
 		// Read files
+		Labels.cNamesEnabled = configuration.cDebug?.enabled ?? true;
 		Labels.readListFiles(configuration, this.memoryModel);
 
 		// Calculate top of stack

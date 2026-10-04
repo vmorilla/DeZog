@@ -1334,6 +1334,42 @@
 									}
 								}
 							},
+							"cDebug": {
+								"type": "object",
+								"additionalProperties": false,
+								"description": "C debugging for z88dk/sdcc programs built with '-debug' (C variables, C names).",
+								"properties": {
+									"enabled": {
+										"type": "boolean",
+										"description": "false = no C scopes and no C names, plain label behavior.",
+										"default": true
+									},
+									"framePointer": {
+										"type": "string",
+										"enum": ["auto", "ix", "iy"],
+										"description": "The frame pointer register used by the C code. 'iy' for '-clib=sdcc_ix'. 'auto' detects it from the function prologue.",
+										"default": "auto"
+									},
+									"registerVariables": {
+										"type": "string",
+										"enum": ["show", "hide"],
+										"description": "Show or hide local variables held in registers (valid only while live).",
+										"default": "show"
+									},
+									"cSymbolNames": {
+										"type": "string",
+										"enum": ["c", "linker"],
+										"description": "Show C names (e.g. 'factorial') or linker names (e.g. '_factorial') in the call stack. The disassembly always shows the linker names.",
+										"default": "c"
+									},
+									"floatFormat": {
+										"type": "string",
+										"enum": ["math32", "math48", "raw"],
+										"description": "The format of float variables: 'math32' (IEEE-754 single, 4 bytes), 'math48' (z88dk 48 bit format, 6 bytes) or 'raw' (bytes).",
+										"default": "math32"
+									}
+								}
+							},
 							"smartDisassemblerArgs": {
 								"type": "object",
 								"additionalProperties": false,

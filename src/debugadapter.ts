@@ -3,6 +3,8 @@ import * as vscode from 'vscode';
 import {HtmlView} from './views/htmlview';
 import {Breakpoint, CapabilitiesEvent, ContinuedEvent, DebugSession, InitializedEvent, InvalidatedEvent, Scope, Source, StackFrame, StoppedEvent, TerminatedEvent, Thread} from '@vscode/debugadapter';
 import {DebugProtocol} from '@vscode/debugprotocol';
+import {CEvaluation, CLocalsScope, CStaticVarsScope, evaluateCStatic, evaluateCVar, stackSource} from './variables/cvars';
+import {CFrameAccess, CFrameResolver} from './variables/cframes';
 import {CallStackFrame} from './callstackframe';
 import {Decoration} from './decoration';
 import {DiagnosticsHandler} from './diagnosticshandler';
@@ -101,6 +103,17 @@ export class DebugSessionClass extends DebugSession {
 
 	/// The local stack that is shown in the VARIABLES section.
 	protected localStackVar: StackVar;
+
+	/// The C scopes (z88dk/sdcc "-debug"): statics of the selected frame's function and globals.
+	protected cLocalsScope: CLocalsScope;
+	protected cLocalsScopeRef: number;
+	protected cFrameResolver: CFrameResolver;
+	protected cStaticsScope: CStaticVarsScope;
+	protected cGlobalsScope: CStaticVarsScope;
+	protected cStaticsScopeRef: number;
+	protected cGlobalsScopeRef: number;
+	/// Reuses the references of expanded C values in WATCH/hover (cleared with listVariables).
+	protected cRefCache = new Map<string, number>();
 
 	/// Only one thread is supported.
 	public static THREAD_ID = 1;
@@ -657,6 +670,14 @@ export class DebugSessionClass extends DebugSession {
 			this.disassemblyVar = new DisassemblyVar();
 			this.disassemblyVar.count = Settings.launch.disassemblerArgs.numberOfLines;
 			this.localStackVar = new StackVar();
+			this.cRefCache.clear();
+			this.cFrameResolver = new CFrameResolver(Labels.cSymbols, Settings.launch.cDebug.framePointer);
+			this.cLocalsScope = new CLocalsScope(this.listVariables);
+			this.cLocalsScopeRef = this.listVariables.addObject(this.cLocalsScope);
+			this.cStaticsScope = new CStaticVarsScope(this.listVariables);
+			this.cGlobalsScope = new CStaticVarsScope(this.listVariables);
+			this.cStaticsScopeRef = this.listVariables.addObject(this.cStaticsScope);
+			this.cGlobalsScopeRef = this.listVariables.addObject(this.cGlobalsScope);
 			this.scopes = [
 				new Scope("Registers", this.listVariables.addObject(new RegistersMainVar())),
 				new Scope("Registers 2", this.listVariables.addObject(new RegistersSecondaryVar())),
@@ -1224,6 +1245,19 @@ export class DebugSessionClass extends DebugSession {
 	 * @returns [sfrs, addresses] The StackFrames (StackFrameAddrs) for vscode and a list of
 	 * addresses without reference to a file. (For the disassembly)
 	 */
+	/** The name shown for a frame. A frame inside a C function is named after
+	 * that function ("factorial", or "_factorial" with cDebug.cSymbolNames
+	 * 'linker'). This is also right for banked calls, whose CALL goes to a
+	 * trampoline. Other frames keep the name found by the call stack analysis,
+	 * shown as C name if it is the linker name of a C function.
+	 */
+	protected frameDisplayName(frame: CallStackFrame): string {
+		const useCNames = Settings.launch.cDebug?.cSymbolNames !== 'linker';
+		const func = Labels.cSymbols.functionAt(frame.addr);
+		return Labels.getDisplayName(func ? func.linkerName : frame.name, useCNames);
+	}
+
+
 	protected stackFramesForCallStack(callStack: RefList<CallStackFrame>): [StackFrameAddr[], number[]] {
 		const frameCount = callStack.length;
 		const sfrs: StackFrameAddr[] = [];
@@ -1239,7 +1273,7 @@ export class DebugSessionClass extends DebugSession {
 				src = this.createSource(file.fileName);
 			}
 			const lineNr = (src) ? this.convertDebuggerLineToClient(file.lineNr) : 0;
-			const sf = new StackFrameAddr(index + 1, frame.name, src, lineNr);
+			const sf = new StackFrameAddr(index + 1, this.frameDisplayName(frame), src, lineNr);
 			sf.longAddress = addr;
 			sfrs.push(sf);
 			if (!src) {
@@ -1450,8 +1484,105 @@ export class DebugSessionClass extends DebugSession {
 		this.localStackVar.setFrameAddress(frame.stack, frame.stackStartAddress);
 
 		// Send response
-		response.body = {scopes: this.scopes};
+		response.body = {scopes: [...this.cScopes(frameId - 1), ...this.scopes]};
 		this.sendResponse(response);
+	}
+
+
+	/** The call stack currently shown (bottom to top). */
+	protected currentCallStack(): RefList<CallStackFrame> {
+		return StepHistory.isInStepBackMode() ? StepHistory.getCallStack() : Remote.getCallStackCache();
+	}
+
+
+	/** The remote access for the C frame resolver. */
+	protected cFrameAccess(): CFrameAccess {
+		return {
+			read: (addr64k, size) => Remote.readMemoryDump(addr64k, size),
+			getRegister: (name) => Remote.getRegisterValue(name),
+			isPagedIn: (longAddress) => Z80Registers.createLongAddress(longAddress & 0xFFFF) === longAddress
+		};
+	}
+
+
+	/** The locals visible in a frame (register variables hidden if so configured). */
+	protected cVisibleLocals(frames: CallStackFrame[], frameIndex: number) {
+		const frame = frames[frameIndex];
+		const func = frame ? Labels.cSymbols.functionAt(frame.addr) : undefined;
+		if (!func)
+			return [];
+		const locals = Labels.cSymbols.visibleLocals(func, frame.addr);
+		if (Settings.launch.cDebug.registerVariables === 'hide')
+			return locals.filter(l => l.v.storage.kind !== 'register');
+		return locals;
+	}
+
+
+	/** The C scopes for a frame: "C Locals" (the parameters and locals
+	 * visible in the frame), "C Statics" (the statics of the function that
+	 * contains the frame's address) and "C Globals". Each is shown only if
+	 * not empty. None if the program has no C debug information or C
+	 * debugging is disabled.
+	 * @param frameIndex The index of the frame in the call stack (frameId - 1).
+	 */
+	protected cScopes(frameIndex: number): Scope[] {
+		const table = Labels.cSymbols;
+		if (!Settings.launch.cDebug?.enabled || !table.hasCdb())
+			return [];
+		const frames = this.currentCallStack();
+		const frame = frames[frameIndex];
+		if (!frame)
+			return [];
+		const scopes: Scope[] = [];
+		this.cLocalsScope.setFrame(frames, frameIndex, this.cVisibleLocals(frames, frameIndex), this.cFrameResolver, this.cFrameAccess());
+		if (!this.cLocalsScope.isEmpty())
+			scopes.push(new Scope("C Locals", this.cLocalsScopeRef));
+		const func = table.functionAt(frame.addr);
+		this.cStaticsScope.setVars(func ? table.getStatics(func) : []);
+		if (!this.cStaticsScope.isEmpty())
+			scopes.push(new Scope("C Statics", this.cStaticsScopeRef));
+		this.cGlobalsScope.setVars(table.getGlobals());
+		if (!this.cGlobalsScope.isEmpty())
+			scopes.push(new Scope("C Globals", this.cGlobalsScopeRef));
+		return scopes;
+	}
+
+
+	/** Evaluates a C name (WATCH and hover) in the context of a frame, in C
+	 * scope order: the locals visible in the frame, then the statics and globals.
+	 * Only plain names are handled ("total", "player", "::player");
+	 * everything else is left to the label expressions.
+	 * @param expression The expression.
+	 * @param frameId The selected frame (optional, default: the top frame).
+	 * @returns The value or undefined if not a C name.
+	 */
+	protected async evaluateCName(expression: string, frameId?: number): Promise<CEvaluation | undefined> {
+		if (!Settings.launch.cDebug?.enabled)
+			return undefined;
+		const name = expression.trim();
+		if (!/^(::)?[A-Za-z_]\w*$/.test(name) || name.startsWith('_'))
+			return undefined;
+		const frames = this.currentCallStack();
+		let frameIndex = frames.length - 1;
+		if (frameId !== undefined && frames[frameId - 1])
+			frameIndex = frameId - 1;
+		const contextPc = frames[frameIndex]?.addr ?? Remote.getPCLong();
+		// Locals (the visible, not shadowed one of that name)
+		const local = this.cVisibleLocals(frames, frameIndex).find(l => !l.shadowed && l.v.cName === name);
+		if (local) {
+			const v = local.v;
+			if (v.storage.kind === 'register') {
+				const isTop = (frameIndex === frames.length - 1);
+				return evaluateCVar(v, isTop ? {registers: v.storage.registers} : {error: '<in register, unavailable>'}, this.listVariables, this.cRefCache);
+			}
+			const bases = await this.cFrameResolver.getFrameBases(frames, this.cFrameAccess());
+			return evaluateCVar(v, stackSource(v, bases[frameIndex]), this.listVariables, this.cRefCache);
+		}
+		// Statics and globals
+		const v = Labels.cSymbols.resolveStatic(name, contextPc);
+		if (!v)
+			return undefined;
+		return evaluateCStatic(v, this.listVariables, this.cRefCache);
 	}
 
 
@@ -2206,9 +2337,16 @@ export class DebugSessionClass extends DebugSession {
 			// Hover
 			case 'hover': {
 				let formattedValue = '';
+				let hoverVarRef = 0;
 				try {
+					// C variable?
+					const cValue = await this.evaluateCName(expression, args.frameId);
+					if (cValue) {
+						formattedValue = cValue.type + ' ' + expression + ' = ' + cValue.value;
+						hoverVarRef = cValue.varRef;
+					}
 					// Check for registers
-					if (Z80RegistersClass.isRegister(expression)) {
+					else if (Z80RegistersClass.isRegister(expression)) {
 						formattedValue = await Expressions.getFormattedRegister(expression, Z80RegisterHoverFormat);
 					}
 					else {
@@ -2249,7 +2387,7 @@ export class DebugSessionClass extends DebugSession {
 				// Response
 				response.body = {
 					result: formattedValue,
-					variablesReference: 0
+					variablesReference: hoverVarRef
 				}
 				break;
 			}
@@ -2257,6 +2395,18 @@ export class DebugSessionClass extends DebugSession {
 			// Watch
 			case 'watch':
 				try {
+					// C variable? (C wins over a label of the same name; not cached: depends on the frame)
+					const cValue = await this.evaluateCName(expression, args.frameId);
+					if (cValue) {
+						response.body = {
+							result: cValue.value,
+							variablesReference: cValue.varRef,
+							type: cValue.type,
+							indexedVariables: cValue.count,
+							memoryReference: (cValue.address !== undefined) ? this.createMemoryReference(cValue.address, 1, cValue.size) : undefined
+						};
+						break;
+					}
 					// Create or get a variable (either a variable reference or an immediate value)
 					const item = await this.evaluateLabelExpression(expression);
 					let result = '';
