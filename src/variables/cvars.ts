@@ -483,6 +483,7 @@ export class CStaticVarsScope extends CVarContainer {
 export type CValueSource =
 	{addr64k: number} |	// Memory
 	{registers: string[]} |	// Registers (top frame only), least significant first
+	{bytes: Uint8Array} |	// A computed value without address (e.g. "n + 1", "&player")
 	{error: string};	// Not available, e.g. "<frame not found>"
 
 
@@ -532,37 +533,72 @@ export interface CEvaluation {
  * (key "address:type:module"). Must be cleared together with the list.
  */
 export async function evaluateCVar(v: CVar, source: CValueSource, list: RefList<ShallowVar>, refCache: Map<string, number>): Promise<CEvaluation> {
+	return evaluateCPlace(v.type, v.module, source, list, refCache);
+}
+
+
+/**
+ * The value of a C value of the given type (WATCH, hover): a variable or the
+ * result of a C expression. See evaluateCVar.
+ * @param type The type.
+ * @param module The module (for struct lookups).
+ * @param source Where the value is.
+ */
+export async function evaluateCPlace(type: CType, module: string, source: CValueSource, list: RefList<ShallowVar>, refCache: Map<string, number>): Promise<CEvaluation> {
 	const fmt = formatter();
 	const table = Labels.cSymbols;
-	const size = Math.max(table.sizeOf(v.type, v.module), 1);
-	const type = fmt.typeName(v.type, v.module);
+	const size = Math.max(table.sizeOf(type, module), 1);
+	const typeName = fmt.typeName(type, module);
 	if ('error' in source)
-		return {value: source.error, type, varRef: 0, size};
+		return {value: source.error, type: typeName, varRef: 0, size};
 	if ('registers' in source) {
 		const bytes = registerBytes(source.registers);
-		return {value: fmt.format(v.type, bytes, 0, v.module) + '  (in ' + registerName(source.registers) + ', may be stale)', type, varRef: 0, size};
+		return {value: fmt.format(type, bytes, 0, module) + '  (in ' + registerName(source.registers) + ', may be stale)', type: typeName, varRef: 0, size};
 	}
-	const addr64k = source.addr64k;
-	const bytes = await Remote.readMemoryDump(addr64k, Math.min(size, 0x10000 - addr64k));
+	const addr64k = ('addr64k' in source) ? source.addr64k : undefined;
+	const bytes = ('bytes' in source) ? source.bytes : await Remote.readMemoryDump(addr64k!, Math.min(size, 0x10000 - addr64k!));
 	let varRef = 0;
-	if (fmt.isExpandable(v.type)) {
-		let childAddr = addr64k;
-		if (v.type.kind === 'pointer')
+	// A computed value has no memory: only a pointer can be expanded (to its target)
+	if (fmt.isExpandable(type) && (addr64k !== undefined || type.kind === 'pointer')) {
+		let childAddr = addr64k ?? 0;
+		if (type.kind === 'pointer')
 			childAddr = bytes[0] | (bytes[1] << 8);
-		if (v.type.kind !== 'pointer' || childAddr !== 0) {
-			const key = childAddr + ':' + JSON.stringify(v.type) + ':' + v.module;
-			varRef = refCache.get(key) ?? list.addObject(new CValueVar(childAddr, v.type, v.module, list));
+		if (type.kind !== 'pointer' || childAddr !== 0) {
+			const key = childAddr + ':' + JSON.stringify(type) + ':' + module;
+			varRef = refCache.get(key) ?? list.addObject(new CValueVar(childAddr, type, module, list));
 			refCache.set(key, varRef);
 		}
 	}
 	return {
-		value: fmt.format(v.type, bytes, 0, v.module),
-		type,
+		value: fmt.format(type, bytes, 0, module),
+		type: typeName,
 		varRef,
-		count: (v.type.kind === 'array') ? v.type.length : undefined,
+		count: (type.kind === 'array') ? type.length : undefined,
 		address: addr64k,
 		size
 	};
+}
+
+
+/** Writes a scalar value to a place given by a C expression (WATCH).
+ * @returns The formatted value read back.
+ * @throws If the place cannot be written (register, computed value, struct).
+ */
+export async function writeCPlace(type: CType, module: string, source: CValueSource, value: number): Promise<string> {
+	if ('registers' in source)
+		throw Error("The value is held in a register and cannot be set.");
+	if ('error' in source)
+		throw Error(source.error);
+	if (!('addr64k' in source))
+		throw Error("Not a variable: the result of an expression cannot be set.");
+	return writeValue(type, module, source.addr64k, value);
+}
+
+
+/** Where the value of a C variable with static storage is (memory or the reason why not). */
+export function staticSource(v: CVar): CValueSource {
+	const loc = staticAddress(v);
+	return ('error' in loc) ? loc : {addr64k: loc.addr64k};
 }
 
 
@@ -648,6 +684,8 @@ export class CLocalsScope extends CVarContainer {
 				return this.createVariable(fmt, name, v.type, v.module, data[blockIndex[i]], 0, src.addr64k);
 			if ('registers' in src)
 				return {name, type: fmt.typeName(v.type, v.module), value: fmt.format(v.type, registerBytes(src.registers), 0, v.module) + '  (in ' + registerName(src.registers) + ', may be stale)', variablesReference: 0};
+			if ('bytes' in src)
+				return {name, type: fmt.typeName(v.type, v.module), value: fmt.format(v.type, src.bytes, 0, v.module), variablesReference: 0};
 			return {name, type: fmt.typeName(v.type, v.module), value: src.error, variablesReference: 0};
 		});
 	}
@@ -659,10 +697,11 @@ export class CLocalsScope extends CVarContainer {
 			return undefined as any;
 		const v = this.locals[index].v;
 		const src = (await this.getSources())[index];
-		if ('registers' in src)
-			throw Error(name + ' is held in a register and cannot be set.');
-		if ('error' in src)
-			throw Error(name + ': ' + src.error);
-		return writeValue(v.type, v.module, src.addr64k, value);
+		try {
+			return await writeCPlace(v.type, v.module, src, value);
+		}
+		catch (e) {
+			throw Error(name + ': ' + e.message);
+		}
 	}
 }

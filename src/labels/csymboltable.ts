@@ -498,6 +498,7 @@ export class CSymbolTable {
 			case 'array': return type.size || type.length * this.sizeOf(type.elem, module);
 			case 'struct': return this.getStruct(type.tag, module)?.size ?? 0;
 			case 'unknown': return type.size;
+			case 'bitfield': return Math.ceil((type.bitOffset + type.bitWidth) / 8);
 			default: return 0;
 		}
 	}

@@ -306,3 +306,22 @@ Phase 1 was widened slightly so that it is useful on its own. Besides the symbol
 
 **Follow-up (not C variables):** DeZog's call-stack analysis gets confused by `banked_call`. It shows extra frames inside the trampoline (`8EE4h`, `8EE5h`) and places the outer `factorial` frame at the function's first address, so it shows line 7 instead of the line of the recursive call. The locals are correct regardless, because the frame-pointer chain doesn't depend on it. The chain also gives each C frame's exact return address, so it could be used to rebuild the C part of the call stack.
 
+
+### Phase 4, as implemented
+
+- **C expressions in WATCH and hover** (`src/variables/cexpr.ts`):
+  - access paths `a.b`, `p->b`, `a[i]`, `*p`, `&a`, `::name`;
+  - integer arithmetic `+ - * / %`, with pointer arithmetic scaled by the element size;
+  - parentheses.
+- **Value semantics:** variables mean their values, so `points[i].y` uses the value of `i`, wherever `i` is stored (stack, register or static).
+- **Fallback to label expressions:** an expression is evaluated as a label expression, unchanged, when:
+  - it doesn't parse as C, or contains `,` or `;` (e.g. `label,2,10`);
+  - it uses no C variable (`0x8000`);
+  - it uses a name that isn't a C variable (`HL`, a label);
+  - it uses a linker name (`_player`).
+- **Errors:** a real error (`player.nope`, `ptr->x`, `n / 0`) is shown in WATCH and suppressed when hovering.
+- **Hover in `.c` files:** an `EvaluatableExpressionProvider` returns the access path up to the hovered name (`player.pos` for `pos`, `player.pos.x` for `x`). Inside an index, it returns the name alone. In sessions of other debuggers it returns the word, as VS Code's default would.
+- **Editing:** WATCH values can be set via `setExpression` (e.g. `points[1].y = 99`), but not register variables or computed values.
+- **Checked live** in jnext on the probe, in `sum_points` (nested blocks, register locals) and against globals; see the session notes.
+
+Not done: logpoint `${…}` and breakpoint conditions with C names (they still use labels, i.e. addresses), casts, `sizeof`, comparisons, and floats in arithmetic.

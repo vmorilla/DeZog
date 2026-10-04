@@ -8,6 +8,7 @@ import {CType, decodeCdbSymbolName, parseCdbRecord, parseCdbType} from '../src/l
 import {CValueFormatter, decodeFloat, decodeMath48, registerName, stackSource} from '../src/variables/cvars';
 import {CFrameAccess, CFrameResolver} from '../src/variables/cframes';
 import {CSymbolTable} from '../src/labels/csymboltable';
+import {CExprContext, CExprUnknownName, CPlace, cExpressionAt, evaluateCExpression, namesInCExpression, parseCExpression} from '../src/variables/cexpr';
 
 
 suite('sdcc CDB records (z88dk -debug)', () => {
@@ -607,5 +608,155 @@ suite('C symbol table: records as written for a bigger project', () => {
 		assert.equal(fmt.format(bool, new Uint8Array([0]), 0), 'false');
 		assert.equal(fmt.format(bool, new Uint8Array([1]), 0), 'true');
 		assert.equal(fmt.format(bool, new Uint8Array([7]), 0), '7');
+	});
+});
+
+
+suite('C expressions (WATCH, hover)', () => {
+	const dir = 'tests/data/labels/projects/z88dk/c_vars_v2';
+	let table: CSymbolTable;
+	let mem: Uint8Array;
+	let regs: {[r: string]: number};
+	let ctx: CExprContext;
+	const poke = (addr: number, ...bytes: number[]) => mem.set(bytes, addr);
+	const int = (size: number, signed: boolean, isChar = false): CType => ({kind: 'int', size, signed, isChar});
+
+	setup(() => {
+		const lbls = new LabelsClass();
+		(WorkspacePaths as any).rootPath = undefined;
+		lbls.readListFiles({
+			z88dkv2: [{path: './' + dir + '/*.lis', mapFile: './' + dir + '/probe.map', srcDirs: [dir], excludeFiles: []}]
+		} as any, new MemoryModelZxNext());
+		table = lbls.cSymbols;
+		mem = new Uint8Array(0x10000);
+		regs = {E: 2, D: 0};
+		// struct sprite player @9280 = {{10, 20}, 3, "HERO", 0}
+		poke(0x9280, 10, 0, 20, 0, 3, 0x48, 0x45, 0x52, 0x4F, 0, 0, 0, 0);
+		// point_t points[3] @9296 = {{1, 11}, {2, 22}, {3, 33}}
+		poke(0x9296, 1, 0, 11, 0, 2, 0, 22, 0, 3, 0, 33, 0);
+		// uint8_t *ptr @928E = &file_static (9277), file_static = 7
+		poke(0x928E, 0x77, 0x92);
+		poke(0x9277, 7);
+		// A local: int n = 4 on the stack @BF14; point_t *p = points @BF16
+		poke(0xBF14, 4, 0);
+		poke(0xBF16, 0x96, 0x92);
+		const places: {[name: string]: CPlace} = {
+			player: {kind: 'memory', addr64k: 0x9280, type: {kind: 'struct', tag: 'sprite'}, module: 'vars_c'},
+			points: {kind: 'memory', addr64k: 0x9296, type: table.resolveStatic('points')!.type, module: 'vars_c'},
+			ptr: {kind: 'memory', addr64k: 0x928E, type: {kind: 'pointer', target: int(1, false, true)}, module: 'vars_c'},
+			n: {kind: 'memory', addr64k: 0xBF14, type: int(2, true), module: 'vars_c'},
+			p: {kind: 'memory', addr64k: 0xBF16, type: {kind: 'pointer', target: {kind: 'struct', tag: 'point'}}, module: 'vars_c'},
+			i: {kind: 'register', registers: ['e'], type: int(1, false, true), module: 'vars_c'}
+		};
+		ctx = {
+			resolve: async name => places[name.replace(/^::/, '')],
+			read: async (addr, size) => mem.slice(addr, addr + size),
+			getRegister: name => regs[name.toUpperCase()],
+			table
+		};
+	});
+
+	const evalText = (text: string) => evaluateCExpression(parseCExpression(text), ctx);
+	const addrOf = async (text: string) => {
+		const place = await evalText(text);
+		assert.equal(place.kind, 'memory', text);
+		return (place as any).addr64k;
+	};
+	const valueOf = async (text: string) => {
+		const place = await evalText(text);
+		const bytes = (place.kind === 'value') ? place.bytes : (place.kind === 'memory') ? mem.slice(place.addr64k, place.addr64k + table.sizeOf(place.type, place.module)) : undefined;
+		return new CValueFormatter(table, 'math32').format(place.type, bytes!, 0, place.module);
+	};
+
+	test('parse: precedence and structure', () => {
+		assert.deepEqual(parseCExpression('player.pos.x'), {kind: 'member', arrow: false, member: 'x', object: {kind: 'member', arrow: false, member: 'pos', object: {kind: 'name', name: 'player'}}});
+		assert.deepEqual(parseCExpression('p->x'), {kind: 'member', arrow: true, member: 'x', object: {kind: 'name', name: 'p'}});
+		assert.deepEqual(parseCExpression('*p'), {kind: 'unary', op: '*', operand: {kind: 'name', name: 'p'}});
+		assert.deepEqual(parseCExpression('n + 2 * 3'), {kind: 'binary', op: '+', left: {kind: 'name', name: 'n'}, right: {kind: 'binary', op: '*', left: {kind: 'number', value: 2}, right: {kind: 'number', value: 3}}});
+		assert.deepEqual(parseCExpression('::player'), {kind: 'name', name: '::player'});
+		assert.deepEqual(parseCExpression(' points [ 0x1 ] . y '), {kind: 'member', arrow: false, member: 'y', object: {kind: 'index', object: {kind: 'name', name: 'points'}, index: {kind: 'number', value: 1}}});
+		for (const bad of ['player.', 'points[1', 'n +', 'n n', 'n,2', '(n', '?', ''])
+			assert.throws(() => parseCExpression(bad), Error, bad);
+		assert.deepEqual(namesInCExpression(parseCExpression('p[i].x + n * 2')), ['p', 'i', 'n']);
+		assert.deepEqual(namesInCExpression(parseCExpression('0x8000 + 2')), []);
+	});
+
+	test('members, indexes and pointers', async () => {
+		assert.equal(await addrOf('player.pos.x'), 0x9280);
+		assert.equal(await addrOf('player.pos.y'), 0x9282);
+		assert.equal(await valueOf('player.pos.y'), '20');
+		assert.equal(await valueOf('player.frame'), '3');
+		assert.equal(await valueOf('player.name'), '"HERO"');
+		assert.equal(await valueOf('player.name[1]'), "69 'E'");
+		assert.equal(await addrOf('points[1].x'), 0x929A);
+		assert.equal(await valueOf('points[2].y'), '33');
+		assert.equal(await valueOf('points[i].y'), '33');	// i = 2 (register E): value semantics
+		assert.equal(await valueOf('points[i - 1].x'), '2');
+		assert.equal(await valueOf('p->y'), '11');
+		assert.equal(await valueOf('p[1].y'), '22');
+		assert.equal(await valueOf('(*p).x'), '1');
+		assert.equal(await addrOf('*p'), 0x9296);
+		assert.equal(await addrOf('*points'), 0x9296);	// Array decays to a pointer
+		assert.equal(await valueOf('*ptr'), '7');
+		assert.equal(await valueOf('ptr[0]'), '7');
+		assert.equal(await valueOf('::player.frame'), '3');
+	});
+
+	test('address-of and arithmetic', async () => {
+		assert.equal(await valueOf('&player'), '0x9280');
+		assert.equal((await evalText('&player')).type.kind, 'pointer');
+		assert.equal(await valueOf('&points[2]'), '0x929E');
+		assert.equal(await valueOf('n + 1'), '5');
+		assert.equal(await valueOf('n * 2 - 1'), '7');
+		assert.equal(await valueOf('(n + 2) * 3'), '18');
+		assert.equal(await valueOf('n / 3'), '1');
+		assert.equal(await valueOf('n % 3'), '1');
+		assert.equal(await valueOf('-n'), '-4');
+		assert.equal(await valueOf('points + 1'), '0x929A');	// Scaled by sizeof(point_t)
+		assert.equal(await valueOf('p + 2'), '0x929E');
+		assert.equal(await valueOf('1 + p'), '0x929A');
+		assert.equal(await valueOf('i + 0x10'), '18');
+	});
+
+	test('the access path under the cursor (hover)', () => {
+		const at = (line: string, hovered: string, occurrence = 0) => {
+			let col = -1;
+			for (let k = 0; k <= occurrence; k++)
+				col = line.indexOf(hovered, col + 1);
+			return cExpressionAt(line, col)?.text;	// Cursor at the start of the name
+		};
+		const line = '    total += player.pos.x + p->y + points[i].x;';
+		assert.equal(at(line, 'player'), 'player');
+		assert.equal(at(line, 'pos'), 'player.pos');
+		assert.equal(at(line, 'x', 0), 'player.pos.x');
+		assert.equal(at(line, 'p->'), 'p');
+		assert.equal(at(line, 'y +'), 'p->y');
+		assert.equal(at(line, 'points'), 'points');
+		assert.equal(at(line, 'i]'), 'i');	// Inside an index: the name alone
+		assert.equal(at(line, 'x', 1), 'points[i].x');
+		assert.equal(at(line, 'total'), 'total');
+		assert.equal(at('a = s . b -> c;', 'c'), 's . b -> c');
+		assert.equal(at('x = ::player.frame;', 'frame'), '::player.frame');
+		// Not on a name
+		assert.equal(cExpressionAt(line, 0), undefined);
+		assert.equal(cExpressionAt('  n = 12;', 7), undefined);
+		const r = cExpressionAt(line, line.indexOf('pos') + 1)!;
+		assert.equal(line.substring(r.start, r.end), 'player.pos');
+	});
+
+	test('errors', async () => {
+		const fails = async (text: string, message: RegExp) => {
+			await assert.rejects(evalText(text), message, text);
+		};
+		await fails('player->x', /needs a pointer/);
+		await fails('n.x', /not a struct/);
+		await fails('player.nope', /No member 'nope'/);
+		await fails('*n', /needs a pointer/);
+		await fails('&i', /register/);
+		await fails('n[1]', /array or a pointer/);
+		await fails('n / 0', /Division by zero/);
+		await fails('p - points', /two pointers/);
+		await fails('player + 1', /Not a number/);
+		await assert.rejects(evalText('counter + 1'), (e: any) => e instanceof CExprUnknownName && e.name === 'counter');
 	});
 });

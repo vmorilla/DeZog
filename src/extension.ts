@@ -16,6 +16,7 @@ import {WhatsNewView} from './whatsnew/whatsnewview';
 import {Z80UnitTestRunner} from './z80unittests/z80unittestrunner';
 import {ZxNextSerialLoopback} from './remotes/dzrptransport/zxnextserialloopback';
 import {Run} from './run';
+import {cExpressionAt} from './variables/cexpr';
 import path = require('path');
 
 
@@ -286,6 +287,23 @@ export function activate(context: vscode.ExtensionContext) {
 	const asmDocSelector: vscode.DocumentSelector = {scheme: 'file'};
 	const inlineValuesProvider = new DeZogInlineValuesProvider();
 	context.subscriptions.push(vscode.languages.registerInlineValuesProvider(asmDocSelector, inlineValuesProvider));
+
+	// Hovering in C files: the whole access path under the cursor, e.g.
+	// "player.pos.x" when hovering "x" (by default only the word is used).
+	// Once a provider exists for a language there is no fallback to the
+	// word, so for other debuggers the word is returned.
+	context.subscriptions.push(vscode.languages.registerEvaluatableExpressionProvider({language: 'c'}, {
+		provideEvaluatableExpression(document: vscode.TextDocument, position: vscode.Position): vscode.ProviderResult<vscode.EvaluatableExpression> {
+			if (vscode.debug.activeDebugSession?.type !== 'dezog') {
+				const wordRange = document.getWordRangeAtPosition(position);
+				return wordRange ? new vscode.EvaluatableExpression(wordRange) : undefined;
+			}
+			const found = cExpressionAt(document.lineAt(position.line).text, position.character);
+			if (!found)
+				return undefined;
+			return new vscode.EvaluatableExpression(new vscode.Range(position.line, found.start, position.line, found.end), found.text);
+		}
+	}));
 
 	/*
 	Actually this did not work very well for other reasons:

@@ -3,7 +3,8 @@ import * as vscode from 'vscode';
 import {HtmlView} from './views/htmlview';
 import {Breakpoint, CapabilitiesEvent, ContinuedEvent, DebugSession, InitializedEvent, InvalidatedEvent, Scope, Source, StackFrame, StoppedEvent, TerminatedEvent, Thread} from '@vscode/debugadapter';
 import {DebugProtocol} from '@vscode/debugprotocol';
-import {CEvaluation, CLocalsScope, CStaticVarsScope, evaluateCStatic, evaluateCVar, stackSource} from './variables/cvars';
+import {CEvaluation, CLocalsScope, CStaticVarsScope, CValueSource, evaluateCPlace, stackSource, staticSource, writeCPlace} from './variables/cvars';
+import {CExprContext, CExprUnknownName, CPlace, evaluateCExpression, namesInCExpression, parseCExpression} from './variables/cexpr';
 import {CFrameAccess, CFrameResolver} from './variables/cframes';
 import {CallStackFrame} from './callstackframe';
 import {Decoration} from './decoration';
@@ -1548,41 +1549,109 @@ export class DebugSessionClass extends DebugSession {
 	}
 
 
-	/** Evaluates a C name (WATCH and hover) in the context of a frame, in C
-	 * scope order: the locals visible in the frame, then the statics and globals.
-	 * Only plain names are handled ("total", "player", "::player");
-	 * everything else is left to the label expressions.
+	/** Resolves a C expression (WATCH, hover) in the context of a frame:
+	 * access paths and integer arithmetic over C variables, e.g. "n",
+	 * "player.pos.x", "p[i].y", "*ptr", "n + 1" (see cexpr.ts). Names are
+	 * resolved in C scope order: the locals visible in the frame, then the
+	 * statics and globals ("::name" forces the global).
 	 * @param expression The expression.
 	 * @param frameId The selected frame (optional, default: the top frame).
-	 * @returns The value or undefined if not a C name.
+	 * @returns The place, an error, or undefined if not a C expression: no C
+	 * debug information, not C syntax (e.g. "label,2,10"), no C variable
+	 * used, a name that is not a C variable, or a linker name ("_player").
+	 * Undefined means: evaluate it as label expression.
 	 */
-	protected async evaluateCName(expression: string, frameId?: number): Promise<CEvaluation | undefined> {
-		if (!Settings.launch.cDebug?.enabled)
+	protected async resolveCExpression(expression: string, frameId?: number): Promise<{place: CPlace} | {error: string} | undefined> {
+		if (!Settings.launch.cDebug?.enabled || !Labels.cSymbols.hasCdb())
 			return undefined;
-		const name = expression.trim();
-		if (!/^(::)?[A-Za-z_]\w*$/.test(name) || name.startsWith('_'))
-			return undefined;
+		const text = expression.trim();
+		if (/[,;]/.test(text))
+			return undefined;	// Label expression syntax
+		let tree;
+		try {
+			tree = parseCExpression(text);
+		}
+		catch {
+			return undefined;	// Not C
+		}
+		const names = namesInCExpression(tree);
+		if (names.length === 0 || names.some(n => n.startsWith('_')))
+			return undefined;	// No C variable, or a linker name
 		const frames = this.currentCallStack();
 		let frameIndex = frames.length - 1;
 		if (frameId !== undefined && frames[frameId - 1])
 			frameIndex = frameId - 1;
 		const contextPc = frames[frameIndex]?.addr ?? Remote.getPCLong();
-		// Locals (the visible, not shadowed one of that name)
-		const local = this.cVisibleLocals(frames, frameIndex).find(l => !l.shadowed && l.v.cName === name);
-		if (local) {
-			const v = local.v;
-			if (v.storage.kind === 'register') {
-				const isTop = (frameIndex === frames.length - 1);
-				return evaluateCVar(v, isTop ? {registers: v.storage.registers} : {error: '<in register, unavailable>'}, this.listVariables, this.cRefCache);
-			}
-			const bases = await this.cFrameResolver.getFrameBases(frames, this.cFrameAccess());
-			return evaluateCVar(v, stackSource(v, bases[frameIndex]), this.listVariables, this.cRefCache);
+		let bases: Awaited<ReturnType<CFrameResolver['getFrameBases']>> | undefined;
+		const ctx: CExprContext = {
+			resolve: async (name: string) => {
+				const plain = name.replace(/^::/, '');
+				if (!name.startsWith('::')) {
+					// Locals (the visible, not shadowed one of that name)
+					const local = this.cVisibleLocals(frames, frameIndex).find(l => !l.shadowed && l.v.cName === plain);
+					if (local) {
+						const v = local.v;
+						if (v.storage.kind === 'register') {
+							if (frameIndex !== frames.length - 1)
+								throw Error(plain + ': <in register, unavailable>');
+							return {kind: 'register', registers: v.storage.registers, type: v.type, module: v.module};
+						}
+						bases ??= await this.cFrameResolver.getFrameBases(frames, this.cFrameAccess());
+						const src = stackSource(v, bases[frameIndex]);
+						if ('error' in src)
+							throw Error(plain + ': ' + src.error);
+						return {kind: 'memory', addr64k: (src as {addr64k: number}).addr64k, type: v.type, module: v.module};
+					}
+				}
+				// Statics and globals
+				const v = Labels.cSymbols.resolveStatic(name, contextPc);
+				if (!v)
+					return undefined;
+				const src = staticSource(v);
+				if ('error' in src)
+					throw Error(plain + ': ' + src.error);
+				return {kind: 'memory', addr64k: (src as {addr64k: number}).addr64k, type: v.type, module: v.module};
+			},
+			read: (addr64k: number, size: number) => Remote.readMemoryDump(addr64k, size),
+			getRegister: (name: string) => Remote.getRegisterValue(name),
+			table: Labels.cSymbols
+		};
+		try {
+			return {place: await evaluateCExpression(tree, ctx)};
 		}
-		// Statics and globals
-		const v = Labels.cSymbols.resolveStatic(name, contextPc);
-		if (!v)
+		catch (e) {
+			if (e instanceof CExprUnknownName)
+				return undefined;	// E.g. a label or register name
+			return {error: e.message};
+		}
+	}
+
+
+	/** Where the result of a C expression is. */
+	protected cPlaceSource(place: CPlace): CValueSource {
+		switch (place.kind) {
+			case 'memory': return {addr64k: place.addr64k};
+			case 'register': return {registers: place.registers};
+			case 'value': return {bytes: place.bytes};
+		}
+	}
+
+
+	/** Evaluates a C expression (WATCH and hover), see resolveCExpression.
+	 * @param expression The expression.
+	 * @param frameId The selected frame (optional, default: the top frame).
+	 * @param errorsAsResult true: an error is returned as value (WATCH),
+	 * false: undefined (hover shows nothing).
+	 * @returns The value or undefined if not a C expression.
+	 */
+	protected async evaluateCName(expression: string, frameId?: number, errorsAsResult = true): Promise<CEvaluation | undefined> {
+		const resolved = await this.resolveCExpression(expression, frameId);
+		if (!resolved)
 			return undefined;
-		return evaluateCStatic(v, this.listVariables, this.cRefCache);
+		if ('error' in resolved)
+			return errorsAsResult ? {value: resolved.error, type: '', varRef: 0, size: 0} : undefined;
+		const place = resolved.place;
+		return evaluateCPlace(place.type, place.module, this.cPlaceSource(place), this.listVariables, this.cRefCache);
 	}
 
 
@@ -2264,6 +2333,29 @@ export class DebugSessionClass extends DebugSession {
 	 */
 	protected async setExpressionRequest(response: DebugProtocol.SetExpressionResponse, args: DebugProtocol.SetExpressionArguments, _request?: DebugProtocol.Request) {
 		response.success = false;	// will be changed if successful.
+		// C expression (e.g. "player.pos.x" in the WATCH pane)
+		const resolved = await this.resolveCExpression(args.expression, args.frameId);
+		if (resolved) {
+			try {
+				if ('error' in resolved)
+					throw Error(resolved.error);
+				if (StepHistory.isInStepBackMode())
+					throw Error('Altering values not allowed in time-travel mode.');
+				const value = Expressions.evalExpression(args.value, true);
+				const place = resolved.place;
+				const formattedString = await writeCPlace(place.type, place.module, this.cPlaceSource(place), value);
+				response.body = {value: formattedString};
+				response.success = true;
+				await this.memoryHasBeenChanged();
+				this.sendEvent(new InvalidatedEvent(['variables']));
+				ShallowVar.clearChanged();
+			}
+			catch (e) {
+				response.message = e.message;
+			}
+			this.sendResponse(response);
+			return;
+		}
 		// Get immediate value
 		const item = this.constExpressionsList.get(args.expression);
 		if (item?.immediateValue) {
@@ -2340,7 +2432,7 @@ export class DebugSessionClass extends DebugSession {
 				let hoverVarRef = 0;
 				try {
 					// C variable?
-					const cValue = await this.evaluateCName(expression, args.frameId);
+					const cValue = await this.evaluateCName(expression, args.frameId, false);
 					if (cValue) {
 						formattedValue = cValue.type + ' ' + expression + ' = ' + cValue.value;
 						hoverVarRef = cValue.varRef;
