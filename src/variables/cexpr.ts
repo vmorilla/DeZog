@@ -6,17 +6,19 @@ import {CSymbolTable} from '../labels/csymboltable';
  * C expressions for the WATCH pane and hovering (design/c-variables.md,
  * section 7): access paths over C variables and simple integer arithmetic.
  *
- *   expression := additive
- *   additive   := multiplicative (('+' | '-') multiplicative)*
- *   multiplicative := unary (('*' | '/' | '%') unary)*
- *   unary      := ('*' | '&' | '-' | '+') unary | postfix
+ *   expression := binary operators with C precedence, lowest first:
+ *                 '||', '&&', '|', '^', '&', '== !=', '< > <= >=', '<< >>', '+ -', '* / %'
+ *   unary      := ('*' | '&' | '-' | '+' | '!' | '~') unary | postfix
  *   postfix    := primary ('.' name | '->' name | '[' expression ']')*
  *   primary    := name | '::' name | number | '(' expression ')'
  *
  * Names are C variables (resolved by the context: locals, statics, globals),
  * numbers are decimal or hex (0x..). Variables have value semantics:
  * "points[i]" uses the value of i. Pointer arithmetic is scaled by the size
- * of the pointed-to type. No casts, no function calls, no floats in arithmetic.
+ * of the pointed-to type. Comparisons and '!', '&&', '||' give 0 or 1;
+ * '&&' and '||' short-circuit (the right side is not evaluated, nor its
+ * memory read, if the left side decides). No casts, no function calls, no
+ * floats in arithmetic.
  */
 
 
@@ -26,8 +28,14 @@ export type CExprNode =
 	{kind: 'number', value: number} |
 	{kind: 'member', object: CExprNode, member: string, arrow: boolean} |
 	{kind: 'index', object: CExprNode, index: CExprNode} |
-	{kind: 'unary', op: '*' | '&' | '-' | '+', operand: CExprNode} |
-	{kind: 'binary', op: '+' | '-' | '*' | '/' | '%', left: CExprNode, right: CExprNode};
+	{kind: 'unary', op: CUnaryOp, operand: CExprNode} |
+	{kind: 'binary', op: CBinaryOp, left: CExprNode, right: CExprNode};
+
+export type CUnaryOp = '*' | '&' | '-' | '+' | '!' | '~';
+export type CBinaryOp = '+' | '-' | '*' | '/' | '%' | '<<' | '>>' | '<' | '>' | '<=' | '>=' | '==' | '!=' | '&' | '^' | '|' | '&&' | '||';
+
+/** The binary operators by precedence level, lowest first (as C). */
+const BINARY_LEVELS: CBinaryOp[][] = [['||'], ['&&'], ['|'], ['^'], ['&'], ['==', '!='], ['<', '>', '<=', '>='], ['<<', '>>'], ['+', '-'], ['*', '/', '%']];
 
 
 /** Where the result of an expression is. */
@@ -66,7 +74,7 @@ type Token = {kind: 'name' | 'number' | 'op', text: string};
 
 function tokenize(text: string): Token[] {
 	const tokens: Token[] = [];
-	const re = /\s*(?:(0[xX][0-9a-fA-F]+|\d+)|([A-Za-z_]\w*)|(->|::|[.[\]()*&+\-/%]))/y;
+	const re = /\s*(?:(0[xX][0-9a-fA-F]+|\d+)|([A-Za-z_]\w*)|(->|::|<<|>>|<=|>=|==|!=|&&|\|\||[.[\]()*&+\-/%<>!~^|]))/y;
 	let pos = 0;
 	while (pos < text.length) {
 		if (/^\s*$/.test(text.substring(pos)))
@@ -125,7 +133,7 @@ export function parseCExpression(text: string): CExprNode {
 		}
 		if (isOp('(')) {
 			i++;
-			const e = additive();
+			const e = binary(0);
 			expect(')');
 			return e;
 		}
@@ -140,7 +148,7 @@ export function parseCExpression(text: string): CExprNode {
 			}
 			else if (isOp('[')) {
 				i++;
-				const index = additive();
+				const index = binary(0);
 				expect(']');
 				node = {kind: 'index', object: node, index};
 			}
@@ -150,7 +158,7 @@ export function parseCExpression(text: string): CExprNode {
 		}
 	};
 	const unary = (): CExprNode => {
-		for (const op of ['*', '&', '-', '+'] as const) {
+		for (const op of ['*', '&', '-', '+', '!', '~'] as const) {
 			if (isOp(op)) {
 				i++;
 				return {kind: 'unary', op, operand: unary()};
@@ -158,24 +166,21 @@ export function parseCExpression(text: string): CExprNode {
 		}
 		return postfix();
 	};
-	const multiplicative = (): CExprNode => {
-		let node = unary();
-		while (isOp('*') || isOp('/') || isOp('%')) {
-			const op = tokens[i++].text as '*' | '/' | '%';
-			node = {kind: 'binary', op, left: node, right: unary()};
+	function binary(level: number): CExprNode {
+		if (level >= BINARY_LEVELS.length)
+			return unary();
+		let node = binary(level + 1);
+		const ops = BINARY_LEVELS[level];
+		for (;;) {
+			const op = ops.find(o => isOp(o));
+			if (!op)
+				return node;
+			i++;
+			node = {kind: 'binary', op, left: node, right: binary(level + 1)};
 		}
-		return node;
-	};
-	function additive(): CExprNode {
-		let node = multiplicative();
-		while (isOp('+') || isOp('-')) {
-			const op = tokens[i++].text as '+' | '-';
-			node = {kind: 'binary', op, left: node, right: multiplicative()};
-		}
-		return node;
 	}
 
-	const tree = additive();
+	const tree = binary(0);
 	if (i < tokens.length)
 		throw Error("Unexpected '" + tokens[i].text + "'");
 	return tree;
@@ -224,7 +229,16 @@ async function placeBytes(place: CPlace, ctx: CExprContext): Promise<Uint8Array>
 }
 
 
-/** The numeric value of a scalar place (int, char, bool, pointer, bitfield). */
+/** The numeric value of a scalar place (int, char, bool, pointer, bitfield).
+ * Arrays decay to their address.
+ * @throws For other types (struct, float, ...).
+ */
+export async function cPlaceToNumber(place: CPlace, ctx: CExprContext): Promise<number> {
+	return toNumber(place, ctx);
+}
+
+
+/** See cPlaceToNumber. */
 async function toNumber(place: CPlace, ctx: CExprContext): Promise<number> {
 	const type = place.type;
 	if (type.kind === 'array' && place.kind === 'memory')
@@ -255,6 +269,12 @@ async function toNumber(place: CPlace, ctx: CExprContext): Promise<number> {
 		}
 	}
 	throw Error("Not a number: " + type.kind);
+}
+
+
+/** A boolean result: int 0 or 1. */
+function boolValue(b: boolean, module: string): CPlace {
+	return {kind: 'value', bytes: encodeInt(b ? 1 : 0, 2), type: INT, module};
 }
 
 
@@ -337,11 +357,25 @@ export async function evaluateCExpression(node: CExprNode, ctx: CExprContext, mo
 				}
 				case '+':
 					return operand;
+				case '!':
+					return boolValue((await toNumber(operand, ctx)) === 0, operand.module);
+				case '~': {
+					const size = (operand.type.kind === 'int') ? Math.max(2, operand.type.size) : 2;
+					return {kind: 'value', bytes: encodeInt(~(await toNumber(operand, ctx)), size), type: {kind: 'int', size, signed: true, isChar: false}, module: operand.module};
+				}
 			}
 			break;
 		}
 		case 'binary': {
 			const left = await evaluateCExpression(node.left, ctx, module);
+			// Short-circuit: the right side is not evaluated if the left side decides
+			if (node.op === '&&' || node.op === '||') {
+				const l = (await toNumber(left, ctx)) !== 0;
+				if (node.op === '&&' ? !l : l)
+					return boolValue(l, left.module);
+				const r = (await toNumber(await evaluateCExpression(node.right, ctx, module), ctx)) !== 0;
+				return boolValue(r, left.module);
+			}
 			const right = await evaluateCExpression(node.right, ctx, module);
 			const lp = pointee(left);
 			const rp = pointee(right);
@@ -356,15 +390,29 @@ export async function evaluateCExpression(node: CExprNode, ctx: CExprContext, mo
 				const addr = (await toNumber(ptr, ctx)) + (node.op === '+' ? step : -step);
 				return {kind: 'value', bytes: encodeInt(addr & 0xFFFF, 2), type: {kind: 'pointer', target: t}, module: ptr.module};
 			}
-			if (lp || rp)
+			if ((lp || rp) && (node.op === '*' || node.op === '/' || node.op === '%'))
 				throw Error("'" + node.op + "' with a pointer");
 			const a = await toNumber(left, ctx);
 			const b = await toNumber(right, ctx);
+			// Comparisons (pointers compare by address)
+			switch (node.op) {
+				case '==': return boolValue(a === b, left.module);
+				case '!=': return boolValue(a !== b, left.module);
+				case '<': return boolValue(a < b, left.module);
+				case '>': return boolValue(a > b, left.module);
+				case '<=': return boolValue(a <= b, left.module);
+				case '>=': return boolValue(a >= b, left.module);
+			}
 			let v: number;
 			switch (node.op) {
 				case '+': v = a + b; break;
 				case '-': v = a - b; break;
 				case '*': v = a * b; break;
+				case '&': v = Number(BigInt(Math.trunc(a)) & BigInt(Math.trunc(b))); break;
+				case '|': v = Number(BigInt(Math.trunc(a)) | BigInt(Math.trunc(b))); break;
+				case '^': v = Number(BigInt(Math.trunc(a)) ^ BigInt(Math.trunc(b))); break;
+				case '<<': v = a * 2 ** b; break;
+				case '>>': v = Math.floor(a / 2 ** b); break;
 				default:
 					if (b === 0)
 						throw Error("Division by zero");

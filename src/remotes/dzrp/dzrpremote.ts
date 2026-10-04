@@ -8,6 +8,8 @@ import {NexFile} from './nexfile';
 import {Settings} from '../../settings/settings';
 import {Utility} from '../../misc/utility';
 import {HexFormat} from '../../misc/hexformat';
+import {CExpressions} from '../../variables/cexprservice';
+import {namesInCExpression} from '../../variables/cexpr';
 import {Expressions} from '../../misc/expressions';
 import * as path from 'path';
 import {Labels} from '../../labels/labels';
@@ -845,6 +847,51 @@ hl: 0x${HexFormat.getHexString(resp.hl, 4)}`;
 	}
 
 
+	/** Like checkConditionAndLog, but a condition that is a C expression
+	 * (z88dk/sdcc, e.g. "n == 2", or "!(n > 0)" from "ASSERTION n > 0") is
+	 * evaluated with C semantics at the PC: variables are values, memory is
+	 * read. Other conditions are evaluated as before.
+	 * See design/c-variables.md, section 12.C.
+	 */
+	protected async checkConditionAndLogAsync(bp: GenericBreakpoint | undefined): Promise<{condition: string | undefined, log: LogEval | undefined}> {
+		const tree = bp?.condition ? CExpressions.parse(bp.condition) : undefined;
+		if (!bp || !tree || !CExpressions.usesOnlyCNames(tree))
+			return this.checkConditionAndLog(bp);
+		const resolved = await CExpressions.resolveAtPc(tree);
+		let message: string | undefined;
+		if (!resolved)
+			message = "a name is not visible here";
+		else if ('error' in resolved)
+			message = resolved.error;
+		else {
+			try {
+				const value = await CExpressions.toNumber(resolved.place, resolved.ctx);
+				return (value !== 0) ? {condition: bp.condition, log: bp.log} : {condition: undefined, log: bp.log};
+			}
+			catch (e) {
+				message = e.message;
+			}
+		}
+		throw Error("Evaluation condition '" + bp.condition + "': " + message);
+	}
+
+
+	/** The values of the C variables of an expression at the PC, for a
+	 * message, e.g. "n = -1, p = 0x9296". Empty if not a C expression. */
+	protected async describeCNames(expression: string): Promise<string> {
+		const tree = CExpressions.parse(expression);
+		if (!tree || !CExpressions.usesOnlyCNames(tree))
+			return '';
+		const parts: string[] = [];
+		for (const name of [...new Set(namesInCExpression(tree))]) {
+			const resolved = await CExpressions.resolveAtPc(name);
+			if (resolved && !('error' in resolved))
+				parts.push(name + ' = ' + await CExpressions.toText(resolved.place));
+		}
+		return parts.join(', ');
+	}
+
+
 	/** Constructs a human readable break-reason-string from the break number, data and
 	 * an already existing reason string.
 	 * @param breakNumber E.g. BREAK_REASON_NUMBER.WATCHPOINT_READ.
@@ -875,6 +922,10 @@ hl: 0x${HexFormat.getHexString(resp.hl, 4)}`;
 				for (const abp of abps) {
 					if (condition === abp.condition) {
 						const assertionCond = Expressions.getAssertionFromCondition(condition);
+						// C assertion: the expression and the values of its variables
+						const cValues = await this.describeCNames(assertionCond);
+						if (cValues)
+							return "Assertion failed: " + assertionCond + " (" + cValues + ")";
 						//reasonString = "Assertion failed: " + assertionCond;
 						const replaced = Expressions.replaceVarsWithValues(assertionCond);
 						reasonString = "Assertion failed: " + replaced;
@@ -999,7 +1050,7 @@ hl: 0x${HexFormat.getHexString(resp.hl, 4)}`;
 				// Loop over all matching breakpoints (normally only one, but could be 2 or more. E.g. if manual BP is at the same point as a LOGPOINT)
 				for (const bp of bps) {
 					// Check for condition
-					let {condition: cond, log} = this.checkConditionAndLog(bp);
+					let {condition: cond, log} = await this.checkConditionAndLogAsync(bp);
 
 					// Emit log?
 					if (cond != undefined && log) {

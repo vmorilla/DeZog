@@ -580,6 +580,25 @@ export async function evaluateCPlace(type: CType, module: string, source: CValue
 }
 
 
+/** The text of a C value, formatted by its type as in WATCH (for logpoints).
+ * @param type The type.
+ * @param module The module (for struct lookups).
+ * @param source Where the value is.
+ */
+export async function formatCPlace(type: CType, module: string, source: CValueSource): Promise<string> {
+	const fmt = formatter();
+	if ('error' in source)
+		return source.error;
+	if ('registers' in source)
+		return fmt.format(type, registerBytes(source.registers), 0, module);
+	if ('bytes' in source)
+		return fmt.format(type, source.bytes, 0, module);
+	const size = Math.max(Labels.cSymbols.sizeOf(type, module), 1);
+	const bytes = await Remote.readMemoryDump(source.addr64k, Math.min(size, 0x10000 - source.addr64k));
+	return fmt.format(type, bytes, 0, module);
+}
+
+
 /** Writes a scalar value to a place given by a C expression (WATCH).
  * @returns The formatted value read back.
  * @throws If the place cannot be written (register, computed value, struct).

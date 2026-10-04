@@ -3,9 +3,9 @@ import * as vscode from 'vscode';
 import {HtmlView} from './views/htmlview';
 import {Breakpoint, CapabilitiesEvent, ContinuedEvent, DebugSession, InitializedEvent, InvalidatedEvent, Scope, Source, StackFrame, StoppedEvent, TerminatedEvent, Thread} from '@vscode/debugadapter';
 import {DebugProtocol} from '@vscode/debugprotocol';
-import {CEvaluation, CLocalsScope, CStaticVarsScope, CValueSource, evaluateCPlace, stackSource, staticSource, writeCPlace} from './variables/cvars';
-import {CExprContext, CExprUnknownName, CPlace, evaluateCExpression, namesInCExpression, parseCExpression} from './variables/cexpr';
-import {CFrameAccess, CFrameResolver} from './variables/cframes';
+import {CEvaluation, CLocalsScope, CStaticVarsScope, evaluateCPlace, writeCPlace} from './variables/cvars';
+import {CPlace} from './variables/cexpr';
+import {CExpressions} from './variables/cexprservice';
 import {CallStackFrame} from './callstackframe';
 import {Decoration} from './decoration';
 import {DiagnosticsHandler} from './diagnosticshandler';
@@ -108,7 +108,6 @@ export class DebugSessionClass extends DebugSession {
 	/// The C scopes (z88dk/sdcc "-debug"): statics of the selected frame's function and globals.
 	protected cLocalsScope: CLocalsScope;
 	protected cLocalsScopeRef: number;
-	protected cFrameResolver: CFrameResolver;
 	protected cStaticsScope: CStaticVarsScope;
 	protected cGlobalsScope: CStaticVarsScope;
 	protected cStaticsScopeRef: number;
@@ -672,7 +671,7 @@ export class DebugSessionClass extends DebugSession {
 			this.disassemblyVar.count = Settings.launch.disassemblerArgs.numberOfLines;
 			this.localStackVar = new StackVar();
 			this.cRefCache.clear();
-			this.cFrameResolver = new CFrameResolver(Labels.cSymbols, Settings.launch.cDebug.framePointer);
+			CExpressions.reset(Labels.cSymbols, Settings.launch.cDebug.framePointer);
 			this.cLocalsScope = new CLocalsScope(this.listVariables);
 			this.cLocalsScopeRef = this.listVariables.addObject(this.cLocalsScope);
 			this.cStaticsScope = new CStaticVarsScope(this.listVariables);
@@ -1496,29 +1495,6 @@ export class DebugSessionClass extends DebugSession {
 	}
 
 
-	/** The remote access for the C frame resolver. */
-	protected cFrameAccess(): CFrameAccess {
-		return {
-			read: (addr64k, size) => Remote.readMemoryDump(addr64k, size),
-			getRegister: (name) => Remote.getRegisterValue(name),
-			isPagedIn: (longAddress) => Z80Registers.createLongAddress(longAddress & 0xFFFF) === longAddress
-		};
-	}
-
-
-	/** The locals visible in a frame (register variables hidden if so configured). */
-	protected cVisibleLocals(frames: CallStackFrame[], frameIndex: number) {
-		const frame = frames[frameIndex];
-		const func = frame ? Labels.cSymbols.functionAt(frame.addr) : undefined;
-		if (!func)
-			return [];
-		const locals = Labels.cSymbols.visibleLocals(func, frame.addr);
-		if (Settings.launch.cDebug.registerVariables === 'hide')
-			return locals.filter(l => l.v.storage.kind !== 'register');
-		return locals;
-	}
-
-
 	/** The C scopes for a frame: "C Locals" (the parameters and locals
 	 * visible in the frame), "C Statics" (the statics of the function that
 	 * contains the frame's address) and "C Globals". Each is shown only if
@@ -1535,7 +1511,7 @@ export class DebugSessionClass extends DebugSession {
 		if (!frame)
 			return [];
 		const scopes: Scope[] = [];
-		this.cLocalsScope.setFrame(frames, frameIndex, this.cVisibleLocals(frames, frameIndex), this.cFrameResolver, this.cFrameAccess());
+		this.cLocalsScope.setFrame(frames, frameIndex, CExpressions.visibleLocals(frames, frameIndex), CExpressions.frameResolver, CExpressions.access());
 		if (!this.cLocalsScope.isEmpty())
 			scopes.push(new Scope("C Locals", this.cLocalsScopeRef));
 		const func = table.functionAt(frame.addr);
@@ -1562,78 +1538,11 @@ export class DebugSessionClass extends DebugSession {
 	 * Undefined means: evaluate it as label expression.
 	 */
 	protected async resolveCExpression(expression: string, frameId?: number): Promise<{place: CPlace} | {error: string} | undefined> {
-		if (!Settings.launch.cDebug?.enabled || !Labels.cSymbols.hasCdb())
-			return undefined;
-		const text = expression.trim();
-		if (/[,;]/.test(text))
-			return undefined;	// Label expression syntax
-		let tree;
-		try {
-			tree = parseCExpression(text);
-		}
-		catch {
-			return undefined;	// Not C
-		}
-		const names = namesInCExpression(tree);
-		if (names.length === 0 || names.some(n => n.startsWith('_')))
-			return undefined;	// No C variable, or a linker name
 		const frames = this.currentCallStack();
 		let frameIndex = frames.length - 1;
 		if (frameId !== undefined && frames[frameId - 1])
 			frameIndex = frameId - 1;
-		const contextPc = frames[frameIndex]?.addr ?? Remote.getPCLong();
-		let bases: Awaited<ReturnType<CFrameResolver['getFrameBases']>> | undefined;
-		const ctx: CExprContext = {
-			resolve: async (name: string) => {
-				const plain = name.replace(/^::/, '');
-				if (!name.startsWith('::')) {
-					// Locals (the visible, not shadowed one of that name)
-					const local = this.cVisibleLocals(frames, frameIndex).find(l => !l.shadowed && l.v.cName === plain);
-					if (local) {
-						const v = local.v;
-						if (v.storage.kind === 'register') {
-							if (frameIndex !== frames.length - 1)
-								throw Error(plain + ': <in register, unavailable>');
-							return {kind: 'register', registers: v.storage.registers, type: v.type, module: v.module};
-						}
-						bases ??= await this.cFrameResolver.getFrameBases(frames, this.cFrameAccess());
-						const src = stackSource(v, bases[frameIndex]);
-						if ('error' in src)
-							throw Error(plain + ': ' + src.error);
-						return {kind: 'memory', addr64k: (src as {addr64k: number}).addr64k, type: v.type, module: v.module};
-					}
-				}
-				// Statics and globals
-				const v = Labels.cSymbols.resolveStatic(name, contextPc);
-				if (!v)
-					return undefined;
-				const src = staticSource(v);
-				if ('error' in src)
-					throw Error(plain + ': ' + src.error);
-				return {kind: 'memory', addr64k: (src as {addr64k: number}).addr64k, type: v.type, module: v.module};
-			},
-			read: (addr64k: number, size: number) => Remote.readMemoryDump(addr64k, size),
-			getRegister: (name: string) => Remote.getRegisterValue(name),
-			table: Labels.cSymbols
-		};
-		try {
-			return {place: await evaluateCExpression(tree, ctx)};
-		}
-		catch (e) {
-			if (e instanceof CExprUnknownName)
-				return undefined;	// E.g. a label or register name
-			return {error: e.message};
-		}
-	}
-
-
-	/** Where the result of a C expression is. */
-	protected cPlaceSource(place: CPlace): CValueSource {
-		switch (place.kind) {
-			case 'memory': return {addr64k: place.addr64k};
-			case 'register': return {registers: place.registers};
-			case 'value': return {bytes: place.bytes};
-		}
+		return CExpressions.resolve(expression, frames, frameIndex);
 	}
 
 
@@ -1651,7 +1560,7 @@ export class DebugSessionClass extends DebugSession {
 		if ('error' in resolved)
 			return errorsAsResult ? {value: resolved.error, type: '', varRef: 0, size: 0} : undefined;
 		const place = resolved.place;
-		return evaluateCPlace(place.type, place.module, this.cPlaceSource(place), this.listVariables, this.cRefCache);
+		return evaluateCPlace(place.type, place.module, CExpressions.source(place), this.listVariables, this.cRefCache);
 	}
 
 
@@ -2343,7 +2252,7 @@ export class DebugSessionClass extends DebugSession {
 					throw Error('Altering values not allowed in time-travel mode.');
 				const value = Expressions.evalExpression(args.value, true);
 				const place = resolved.place;
-				const formattedString = await writeCPlace(place.type, place.module, this.cPlaceSource(place), value);
+				const formattedString = await writeCPlace(place.type, place.module, CExpressions.source(place), value);
 				response.body = {value: formattedString};
 				response.success = true;
 				await this.memoryHasBeenChanged();

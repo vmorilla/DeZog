@@ -471,6 +471,28 @@ _initbankedsp: ld (tempsp),sp / ld hl,-100 / add hl,sp / ld sp,hl
 - **Live result** (jnext, sample, `factorial` at the third recursion level): `main` (line 14) → `factorial` → `factorial` → `factorial` (line 15), with `n` = 5, 4, 3 and no `8EE4h` frames.
 - **Not done:** zsim's own step out (`ZSimRemote`), reverse debugging's call stack (`cpuhistory.ts`), the disassembly of the `defq` as data, and step into a banked call (it steps into `banked_call`).
 
+### 12.A–C, as implemented
+
+- **A. The service** (`src/variables/cexprservice.ts`, singleton `CExpressions`, reset at launch) holds the resolution moved out of `debugadapter.ts`: the parse rule, the visible locals, the frame bases, the scope order and the formatting. WATCH, hover, the scopes, logpoints and conditions all use it.
+- **A. The grammar** (`cexpr.ts`) adds:
+  - comparisons, `&&`/`||`/`!` (giving 0 or 1), and `& | ^ ~ << >>`, all with C precedence;
+  - short-circuit `&&`/`||`: a unit test proves that `p != 0 && p->x > 3` with `p` NULL doesn't read address 0;
+  - pointers compare by address.
+- **B. Logpoints** (`LogEval`): a `${…}` whose expression uses only names that are C variables somewhere in the program (`CSymbolTable.isKnownCName`) becomes a C segment `${c:<format>#<expression>}`.
+  - It's evaluated when the logpoint is hit, at the PC: by C type for `string`, or by the format (`hex8`, …).
+  - A name not visible at the PC prints `<'x' is not visible here>`; errors print in place.
+  - Everything else (`_player`, registers, `b@(…)`) is prepared as before.
+  - Source logpoints (`// LOGPOINT`) use the same `LogEval`.
+- **C. Conditions and assertions** (`DzrpRemote.checkConditionAndLogAsync`, used by `evalBpConditionAndLog`): a C condition is evaluated at the PC with C semantics; others as before.
+  - A failed C assertion reports the values: `Assertion failed: dx < 2 (dx = 2)`.
+  - zsim still uses the synchronous `checkConditionAndLog` (decision 1).
+- **Checked live** in jnext on the probe, in `sum_points`:
+  - the logpoint `i=${i} dx=${dx} total=${total} x=${p[i].x} hex=${p[i].x:hex8} first=${i == 0} g=${global_counter} hidden=${calls}` printed one correct line per iteration;
+  - the condition `i == 1` skipped the first iteration;
+  - `// ASSERTION dx < 2` stopped in the second iteration with the message above.
+- **Not checked live:** source `// LOGPOINT` comments with C names (same `LogEval` path), and the banked sample (it was being edited while testing).
+- **Note:** a C variable shadows a register of the same name in conditions (C wins, as in WATCH): a condition `a == 5` means the variable `a` if one exists.
+
 ### 12.E Decisions (2026-10-04)
 
 1. C conditions in zsim come later (12.C.3).

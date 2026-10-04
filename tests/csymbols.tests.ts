@@ -2,6 +2,7 @@ import * as assert from 'assert';
 import {suite, test, setup, teardown} from 'mocha';
 import {Labels, LabelsClass} from '../src/labels/labels';
 import {Expressions} from '../src/misc/expressions';
+import {LogEval} from '../src/misc/logeval';
 import {MemoryModelZxNext} from '../src/remotes/MemoryModel/zxnextmemorymodels';
 import {WorkspacePaths} from '../src/misc/workspacepaths';
 import {CType, decodeCdbSymbolName, parseCdbRecord, parseCdbType} from '../src/labels/z88dkcdb';
@@ -718,6 +719,43 @@ suite('C expressions (WATCH, hover)', () => {
 		assert.equal(await valueOf('i + 0x10'), '18');
 	});
 
+	test('comparisons, logic and bitwise operators', async () => {
+		// Precedence as C
+		assert.deepEqual(parseCExpression('a || b && c'), {kind: 'binary', op: '||', left: {kind: 'name', name: 'a'}, right: {kind: 'binary', op: '&&', left: {kind: 'name', name: 'b'}, right: {kind: 'name', name: 'c'}}});
+		assert.deepEqual(parseCExpression('n + 1 > 4'), {kind: 'binary', op: '>', left: {kind: 'binary', op: '+', left: {kind: 'name', name: 'n'}, right: {kind: 'number', value: 1}}, right: {kind: 'number', value: 4}});
+		assert.deepEqual(parseCExpression('n & 1 == 0'), {kind: 'binary', op: '&', left: {kind: 'name', name: 'n'}, right: {kind: 'binary', op: '==', left: {kind: 'number', value: 1}, right: {kind: 'number', value: 0}}});
+		assert.deepEqual(parseCExpression('!n'), {kind: 'unary', op: '!', operand: {kind: 'name', name: 'n'}});
+		assert.deepEqual(parseCExpression('a&&b'), {kind: 'binary', op: '&&', left: {kind: 'name', name: 'a'}, right: {kind: 'name', name: 'b'}});
+		// n = 4
+		for (const [text, value] of [
+			['n == 4', '1'], ['n != 4', '0'], ['n < 5', '1'], ['n > 5', '0'], ['n <= 4', '1'], ['n >= 5', '0'],
+			['n > 1 && n < 10', '1'], ['n > 10 || n == 4', '1'], ['!n', '0'], ['!(n - 4)', '1'],
+			['n & 6', '4'], ['n | 1', '5'], ['n ^ 5', '1'], ['n << 2', '16'], ['n >> 1', '2'], ['~n', '-5'],
+			['player.pos.x == 10 && points[1].y == 22', '1'],
+			['p == points', '1'], ['p != 0', '1'], ['ptr == &player', '0'], ['p + 1 == &points[1]', '1']
+		])
+			assert.equal(await valueOf(text), value, text);
+	});
+
+	test('&& and || short-circuit (no memory read on the right side)', async () => {
+		const reads: number[] = [];
+		const read = ctx.read;
+		ctx.read = async (addr, size) => {
+			reads.push(addr);
+			return read(addr, size);
+		};
+		// A null pointer: the right side would read address 0
+		poke(0xBF16, 0, 0);	// p = NULL
+		assert.equal(await valueOf('p != 0 && p->x > 3'), '0');
+		assert.ok(!reads.includes(0x0000), 'p->x must not be read');
+		assert.equal(await valueOf('p == 0 || p->x > 3'), '1');
+		assert.ok(!reads.includes(0x0000), 'p->x must not be read');
+		// The right side is read when needed
+		poke(0xBF16, 0x96, 0x92);	// p = points
+		assert.equal(await valueOf('p != 0 && p->x > 0'), '1');
+		assert.ok(reads.includes(0x9296));
+	});
+
 	test('the access path under the cursor (hover)', () => {
 		const at = (line: string, hovered: string, occurrence = 0) => {
 			let col = -1;
@@ -758,5 +796,48 @@ suite('C expressions (WATCH, hover)', () => {
 		await fails('p - points', /two pointers/);
 		await fails('player + 1', /Not a number/);
 		await assert.rejects(evalText('counter + 1'), (e: any) => e instanceof CExprUnknownName && e.name === 'counter');
+	});
+});
+
+
+suite('C names in logpoints (preparation)', () => {
+	const dir = 'tests/data/labels/projects/z88dk/c_vars_v2';
+	const z80Registers: any = {getRegValueByName: () => 0};
+	const remote: any = {readMemoryDump: async (_a: number, size: number) => new Uint8Array(size)};
+	const prepared = (message: string) => (new LogEval(message, remote, z80Registers, Labels) as any).preparedExpression as string;
+
+	setup(() => {
+		(WorkspacePaths as any).rootPath = undefined;
+		Labels.cNamesEnabled = true;
+		Labels.readListFiles({
+			z88dkv2: [{path: './' + dir + '/*.lis', mapFile: './' + dir + '/probe.map', srcDirs: [dir], excludeFiles: []}]
+		} as any, new MemoryModelZxNext());
+	});
+
+	teardown(() => {
+		Labels.readListFiles({} as any, new MemoryModelZxNext());	// Clear
+	});
+
+	test('C expressions are kept for evaluation at the PC', () => {
+		assert.equal(prepared('p=${p}'), 'p=${c:string#p}');	// A local of sum_points
+		assert.equal(prepared('${count + 1}'), '${c:string#count + 1}');
+		assert.equal(prepared('frame=${player.frame:hex8}'), 'frame=${c:hex8#player.frame}');
+		assert.equal(prepared('${::player.pos.x}'), '${c:string#::player.pos.x}');	// '::' is not a format separator
+		assert.equal(prepared('${p != 0 && p->x > 3:uint8}'), '${c:uint8#p != 0 && p->x > 3}');
+		assert.equal(prepared('${dx}'), '${c:string#dx}');	// A block-local of sum_points
+		// A name that is no C variable of the program: as before (an unknown label)
+		assert.throws(() => prepared('${n}'), /n is not defined/);
+	});
+
+	test('everything else is prepared as before', () => {
+		// Linker name, register, memory access: not C
+		assert.ok(!prepared('${_player}').includes('${c:'));
+		assert.ok(!prepared('${A}').includes('${c:'));
+		assert.ok(!prepared('${w@(HL):hex16}').includes('${c:'));
+		assert.ok(!prepared('${b@(_player):hex8}').includes('${c:'));
+		// Without C debugging no C segments
+		Labels.cNamesEnabled = false;
+		Labels.readListFiles({} as any, new MemoryModelZxNext());
+		assert.throws(() => prepared('${count}'));	// Unknown label, as before
 	});
 });

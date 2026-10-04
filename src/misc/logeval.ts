@@ -2,6 +2,7 @@ import {LabelsClass} from '../labels/labels';
 import {Z80RegistersClass} from '../remotes/z80registers';
 import {RemoteBase} from '../remotes/remotebase';
 import {HexFormat} from '../misc/hexformat';
+import {CExpressions} from '../variables/cexprservice';
 
 
 /** Evaluates log expressions.
@@ -53,6 +54,11 @@ export class LogEval {
 
 		// Prepare expression
 		this.preparedExpression = expression.replace(this.regexMain, (_match, p1) => {
+			// A C expression (e.g. "${n}", "${player.pos.x:hex8}") is evaluated when
+			// the logpoint is hit: its locals depend on the frame
+			const cSegment = this.prepareCExpression(p1);
+			if (cSegment)
+				return cSegment;
 			const [format, prepared] = this.prepareExpression(p1);
 			try {
 				this.checkExpressionSyntax(prepared);	// Throws an exception if the syntax is wrong.
@@ -62,6 +68,51 @@ export class LogEval {
 			}
 			return "${" + format + ":" + prepared + "}";
 		});
+	}
+
+
+	/** Prepares a C expression (z88dk/sdcc, see design/c-variables.md 12.B):
+	 * if the expression uses only C variable names (and no linker names like
+	 * "_player") it is kept as text, marked with the format 'c':
+	 * "${c:<format>#<expression>}". It is evaluated in evaluate(), at the PC.
+	 * The format is the part after the last ':' if it is a known format, so
+	 * "::player" stays part of the expression.
+	 * @param expr The text between "${" and "}", e.g. "n" or "player.frame:hex8".
+	 * @returns The prepared segment or undefined if not a C expression.
+	 */
+	protected prepareCExpression(expr: string): string | undefined {
+		const match = /^(.*?)(?::\s*(string|hex8|hex16|int8|int16|uint8|uint16|bits|flags))?\s*$/s.exec(expr)!;
+		const text = match[1].trim();
+		const format = match[2] ?? 'string';
+		const tree = CExpressions.parse(text);
+		if (!tree || !CExpressions.usesOnlyCNames(tree))
+			return undefined;
+		return '${c:' + format + '#' + text + '}';
+	}
+
+
+	/** Evaluates a C expression segment at the PC (see prepareCExpression).
+	 * @param segment "<format>#<expression>".
+	 * @returns The text: formatted by the C type ('string') or by the format.
+	 * Errors are returned in place, e.g. "<n: frame not found>".
+	 */
+	protected async evaluateCExpression(segment: string): Promise<string> {
+		const k = segment.indexOf('#');
+		const format = segment.substring(0, k);
+		const text = segment.substring(k + 1);
+		const resolved = await CExpressions.resolveAtPc(text);
+		if (!resolved)
+			return "<'" + text + "' is not visible here>";
+		if ('error' in resolved)
+			return '<' + resolved.error + '>';
+		try {
+			if (format === 'string')
+				return await CExpressions.toText(resolved.place);
+			return this.formatValue(format, await CExpressions.toNumber(resolved.place, resolved.ctx));
+		}
+		catch (e) {
+			return '<' + e.message + '>';
+		}
 	}
 
 
@@ -288,7 +339,7 @@ export class LogEval {
 				const j = p1.indexOf(':');
 				const format = p1.substring(0, j);
 				const expr = p1.substring(j + 1);
-				const result = await this.customEval(expr);
+				const result = (format === 'c') ? await this.evaluateCExpression(expr) : await this.customEval(expr);
 				// Concatenate
 				evaluatedString += this.preparedExpression.substring(k, i);
 				let retValue: any;

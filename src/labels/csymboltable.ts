@@ -456,6 +456,19 @@ export class CSymbolTable {
 	}
 
 
+	/** True if the name is a C variable anywhere in the program: a global,
+	 * a file or function static, a parameter or a local of any function. */
+	public isKnownCName(name: string): boolean {
+		if (this.globals.has(name))
+			return true;
+		for (const statics of this.fileStatics.values()) {
+			if (statics.has(name))
+				return true;
+		}
+		return this.functions.some(f => f.statics.has(name) || f.locals.some(v => v.cName === name));
+	}
+
+
 	/** The fallback for builds without CDB records: "name" -> "_name" if
 	 * that is a public symbol of a C module.
 	 * @returns The linker name or undefined.
