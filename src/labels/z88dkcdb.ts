@@ -16,8 +16,8 @@
  * Type: "{<size>}" followed by a comma separated chain of declarators
  * (DA<n>d array, DG/DC/DX/DD/DP/DI pointer, DF function) and one specifier
  * (SC char, SS short, SI int, SL long, SLL long long, SF float, SV void,
- * ST<tag> struct/union, SB<offset>$<width> bitfield) with ":S" (signed) or
- * ":U" (unsigned).
+ * ST<tag> struct/union, SB<offset>$<width> bitfield, empty for _Bool) with
+ * ":S" (signed) or ":U" (unsigned).
  */
 
 
@@ -27,7 +27,7 @@ export const CDB_SYMBOL_PREFIX = '__CDBINFO__';
 
 /** A C type, decoded from a CDB type chain. */
 export type CType =
-	{kind: 'int', size: number, signed: boolean, isChar: boolean} |
+	{kind: 'int', size: number, signed: boolean, isChar: boolean, isBool?: boolean} |
 	{kind: 'float', size: number} |
 	{kind: 'void'} |
 	{kind: 'pointer', target: CType} |
@@ -133,6 +133,8 @@ function parseSpecifier(spec: string, size: number | undefined): CType {
 		return {kind: 'bitfield', bitOffset: parseInt(bitfield[1]), bitWidth: parseInt(bitfield[2]), signed};
 	if (name === 'SV')
 		return {kind: 'void'};
+	if (name === '')
+		return {kind: 'int', size: size ?? 1, signed: false, isChar: false, isBool: true};	// _Bool, e.g. '{1}:S'
 	if (name === 'SF')
 		return {kind: 'float', size: size ?? 4};
 	if (name === 'SLL')

@@ -7,6 +7,7 @@ import {WorkspacePaths} from '../src/misc/workspacepaths';
 import {CType, decodeCdbSymbolName, parseCdbRecord, parseCdbType} from '../src/labels/z88dkcdb';
 import {CValueFormatter, decodeFloat, decodeMath48, registerName, stackSource} from '../src/variables/cvars';
 import {CFrameAccess, CFrameResolver} from '../src/variables/cframes';
+import {CSymbolTable} from '../src/labels/csymboltable';
 
 
 suite('sdcc CDB records (z88dk -debug)', () => {
@@ -546,5 +547,65 @@ suite('C frame bases', () => {
 		const c = lbls.cSymbols;
 		assert.equal((await resolver.getPrologue(c.functionAt(page(4, 0x8F85))!, access)).usesFrame, true);
 		assert.equal((await resolver.getPrologue(c.functionAt(page(4, 0x903C))!, access)).usesFrame, false);
+	});
+});
+
+
+suite('C symbol table: records as written for a bigger project', () => {
+	// Encodes a CDB record as z88dk writes it into the map file
+	const encode = (text: string) => '__CDBINFO__' + text.replace(/[^A-Za-z0-9]/g, c => '_' + c.charCodeAt(0).toString(16).padStart(2, '0'));
+	const sym = (name: string, value: number, module: string, scope = 'public', type = 'addr'): any => ({name, value, type, scope, module, section: 'code', location: ''});
+	const cdb = (text: string, module: string) => sym(encode(text), 1, module, 'public', 'const');
+
+	function load(cdbSymbols: any[], mapSymbols: any[]): CSymbolTable {
+		const table = new CSymbolTable();
+		table.load('test.map', cdbSymbols, mapSymbols, {
+			getPublic: name => mapSymbols.find(s => s.name === name && s.scope === 'public'),
+			getLocal: (module, name) => mapSymbols.find(s => s.name === name && s.module === module && s.scope === 'local'),
+			getLocalNames: module => mapSymbols.filter(s => s.module === module && s.scope === 'local').map(s => s.name),
+			addressSymbols: mapSymbols,
+			toLongAddress: value => value + 0x50000,
+			slotEnd: () => 0x5A000,
+			cLines: []
+		});
+		return table;
+	}
+
+	test('a function with two F records keeps its locals', () => {
+		const m = 'menu_player_choice_c';
+		const table = load([
+			cdb('F:Fmenu_menu_player_choice$check_cheating_phrase$0_0$0({2}DF,SV:S),C,0,-3,0,0,0', m),
+			cdb('F:Fmenu_menu_player_choice$check_cheating_phrase$0_0$0({2}DF,SV:S),C,0,0,0,0,0', m),
+			cdb('S:Lmenu_menu_player_choice.check_cheating_phrase$key$1_0$578({2}SI:S),R,0,0,[e,d]', m)
+		], [sym('_check_cheating_phrase', 0x9D86, m, 'local'), sym('_next_fn', 0x9DF0, m)]);
+		const func = table.functionAt(0x59D92)!;
+		assert.equal(func.cName, 'check_cheating_phrase');
+		assert.deepEqual(table.visibleLocals(func, 0x59D92).map(l => l.v.cName), ['key']);
+	});
+
+	test('a global recorded only by a declaring module', () => {
+		const table = load([
+			cdb('S:G$cheating$0_0$0({1}:S),E,0,0', 'menu_opponent_intro_c'),	// Declaration (extern)
+			cdb('S:G$errno$0_0$0({2}SI:S),E,0,0', 'menu_opponent_intro_c')	// Library global
+		], [
+			sym('_cheating', 0xE194, 'menu_opponents_c'),	// Defined in a C module without a record
+			sym('_errno', 0x9290, '_errno')	// Defined in an assembler library module
+		]);
+		const cheating = table.resolveStatic('cheating')!;
+		assert.deepEqual(cheating.storage, {kind: 'static', longAddress: 0x5E194});
+		assert.equal(cheating.module, 'menu_opponents_c');
+		assert.deepEqual(cheating.type, {kind: 'int', size: 1, signed: false, isChar: false, isBool: true});
+		assert.equal(table.resolveStatic('errno'), undefined);
+		assert.deepEqual(table.getGlobals().map(v => v.cName), ['cheating']);
+	});
+
+	test('_Bool', () => {
+		assert.deepEqual(parseCdbType('{1}:S').type, {kind: 'int', size: 1, signed: false, isChar: false, isBool: true});
+		const fmt = new CValueFormatter(new CSymbolTable(), 'math32');
+		const bool: CType = {kind: 'int', size: 1, signed: false, isChar: false, isBool: true};
+		assert.equal(fmt.typeName(bool), 'bool');
+		assert.equal(fmt.format(bool, new Uint8Array([0]), 0), 'false');
+		assert.equal(fmt.format(bool, new Uint8Array([1]), 0), 'true');
+		assert.equal(fmt.format(bool, new Uint8Array([7]), 0), '7');
 	});
 });

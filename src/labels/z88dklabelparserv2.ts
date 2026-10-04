@@ -8,6 +8,7 @@ import {AsmConfigBase, Z88dkConfig} from '../settings/settings';
 import {UnifiedPath} from '../misc/unifiedpath';
 import {CDBINFO_PREFIX, C_LINE_PREFIX, Z88dkMapSymbol, isDebugSymbol, parseLineLocation, parseMapLine, stripDebugFileName} from './z88dkmapfile';
 import {CSymbolTable} from './csymboltable';
+import * as fglob from 'fast-glob';
 
 /**
  * This class parses z88dk asm list files.
@@ -165,6 +166,14 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 	/// The C source file (relative path) of each module, from the .lis files.
 	/// The C_LINE information contains only the file name without directory.
 	protected moduleCFiles = new Map<string, string>();
+
+	/// The C source file of each module from all .lis files parsed so far.
+	/// Not cleared per .lis file: the C lines of the map file are associated
+	/// at the end of every .lis file, also those of the other modules.
+	protected knownModuleCFiles = new Map<string, string>();
+
+	/// Source files found by name in the source directories (see findSourceFile).
+	protected sourceFileSearchCache = new Map<string, string | undefined>();
 
 	/// All __C_LINE_ symbols of the map file. Empty if not compiled with "-debug".
 	protected cLineSymbols: Z88dkMapSymbol[] = [];
@@ -429,8 +438,10 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 			// Stop any previous "include"
 			this.includeFileStack.length = 0;
 			this.includeStart(fileName);
-			if (this.currentCSourceFile())
+			if (this.currentCSourceFile()) {
 				this.moduleCFiles.set(this.currentModule, this.includeFileStack[0].fileName);
+				this.knownModuleCFiles.set(this.currentModule, this.includeFileStack[0].fileName);
+			}
 			// Resets current C line
 			this.currentCLine = 0;
 			return;
@@ -555,11 +566,11 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 			let fileName = relFileCache.get(cacheKey);
 			if (!relFileCache.has(cacheKey)) {
 				// Prefer the C file of the module's .lis file (C_LINE contains no directory)
-				const moduleCFile = this.moduleCFiles.get(sym.module);
+				const moduleCFile = this.moduleCFiles.get(sym.module) ?? this.knownModuleCFiles.get(sym.module);
 				if (moduleCFile && this.isSameFile(info.fileName, moduleCFile))
 					fileName = moduleCFile;
 				else
-					fileName = WorkspacePaths.getRelSourceFilePath(UnifiedPath.getUnifiedPath(info.fileName), config.srcDirs);
+					fileName = this.findSourceFile(UnifiedPath.getUnifiedPath(info.fileName), config.srcDirs);
 				if (config.excludeFiles.some(glob => minimatch(fileName!, glob)))
 					fileName = undefined;
 				relFileCache.set(cacheKey, fileName);
@@ -627,6 +638,34 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 				});
 			}
 		}
+	}
+
+
+	/** Finds the source file of a C line whose module's .lis file has not
+	 * been parsed (yet). The name has no directory (e.g. "menu_player_choice.c"
+	 * for "src/menu/menu_player_choice.c"), so it is looked for directly in
+	 * the source directories first, then in their subdirectories. A name found
+	 * more than once is ambiguous and left as is.
+	 * @param name The file name from the C line, e.g. "menu_player_choice.c".
+	 * @param srcDirs The source directories.
+	 * @returns The path in the same form as for the .lis files.
+	 */
+	protected findSourceFile(name: string, srcDirs: string[]): string {
+		const direct = WorkspacePaths.getRelSourceFilePath(name, srcDirs);
+		if (direct !== name || UnifiedPath.isAbsolute(name))
+			return direct;	// Found directly in a source directory
+		let found = this.sourceFileSearchCache.get(name);
+		if (!this.sourceFileSearchCache.has(name)) {
+			const matches: string[] = [];
+			for (const srcDir of srcDirs) {
+				const absDir = WorkspacePaths.getAbsFilePath(srcDir);
+				for (const rel of fglob.sync('**/' + fglob.escapePath(name), {cwd: absDir, onlyFiles: true}))
+					matches.push(UnifiedPath.join(srcDir, rel));
+			}
+			found = (matches.length === 1) ? matches[0] : undefined;
+			this.sourceFileSearchCache.set(name, found);
+		}
+		return found ?? direct;
 	}
 
 

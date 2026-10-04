@@ -188,6 +188,11 @@ export class CSymbolTable {
 		// Functions (defined in this module: the linker symbol belongs to it)
 		const newFunctions: CFunction[] = [];
 		for (const {symbol, module} of functionSymbols) {
+			// sdcc may write a function's record twice (e.g. a static function
+			// with a forward declaration): one function only, or its locals end
+			// up on a copy that is never found
+			if (newFunctions.some(f => f.cName === symbol.name && f.module === module))
+				continue;
 			const linkerName = '_' + symbol.name;
 			const mapSym = (symbol.scope === 'F') ? access.getLocal(module, linkerName) : access.getPublic(linkerName);
 			if (!mapSym || mapSym.module !== module)
@@ -210,15 +215,30 @@ export class CSymbolTable {
 		this.functions.sort((a, b) => a.start - b.start);
 
 		// Variables
+		const declaredGlobals: CdbSymbol[] = [];
 		for (const {symbol, module} of varSymbols) {
 			if (symbol.type.kind === 'function')
 				continue;	// Function declaration
-			if (symbol.scope === 'G')
-				this.addGlobal(symbol, module, access);
+			if (symbol.scope === 'G') {
+				if (!this.addGlobal(symbol, module, access))
+					declaredGlobals.push(symbol);
+			}
 			else if (symbol.scope === 'F')
 				this.addFileStatic(symbol, module, access);
 			else
 				this.addLocal(symbol, module, access, newFunctions);
+		}
+		// Globals whose defining module wrote no record: take the type from a
+		// declaration if the symbol is defined in a C module (not a library)
+		for (const symbol of declaredGlobals) {
+			if (this.globals.has(symbol.name))
+				continue;
+			const linkerName = '_' + symbol.name;
+			const mapSym = access.getPublic(linkerName);
+			if (!mapSym || !mapSym.module.endsWith('_c'))
+				continue;
+			this.globals.set(symbol.name, this.createStaticVar(symbol, mapSym.module, linkerName, access.toLongAddress(mapSym.value)));
+			this.linkerToC.set(linkerName, symbol.name);
 		}
 	}
 
@@ -261,15 +281,18 @@ export class CSymbolTable {
 	}
 
 
-	/** A global is added only by the module that defines it (header
-	 * declarations appear in every including module). */
-	protected addGlobal(symbol: CdbSymbol, module: string, access: CMapAccess) {
+	/** Adds a global from the record of the module that defines it (header
+	 * declarations appear in every including module).
+	 * @returns false if the record is a declaration only.
+	 */
+	protected addGlobal(symbol: CdbSymbol, module: string, access: CMapAccess): boolean {
 		const linkerName = '_' + symbol.name;
 		const mapSym = access.getPublic(linkerName);
 		if (!mapSym || mapSym.module !== module)
-			return;	// Declaration only
+			return false;	// Declaration only
 		this.globals.set(symbol.name, this.createStaticVar(symbol, module, linkerName, access.toLongAddress(mapSym.value)));
 		this.linkerToC.set(linkerName, symbol.name);
+		return true;
 	}
 
 

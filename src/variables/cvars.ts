@@ -127,6 +127,8 @@ export class CValueFormatter {
 	public typeName(type: CType, module?: string): string {
 		switch (type.kind) {
 			case 'int': {
+				if (type.isBool)
+					return 'bool';
 				let name: string;
 				if (type.isChar)
 					name = 'char';
@@ -176,6 +178,8 @@ export class CValueFormatter {
 		switch (type.kind) {
 			case 'int': {
 				const value = readInt(bytes, offset, type.size, type.signed);
+				if (type.isBool)
+					return (value === 0) ? 'false' : (value === 1) ? 'true' : value.toString();
 				// The char only if printable: sdcc's uint8_t is a char, too
 				const code = bytes[offset];
 				if (type.isChar && code >= 0x20 && code < 0x7F)

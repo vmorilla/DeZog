@@ -416,3 +416,44 @@ suite('Labels (z88dk v2 format, source in sub directory)', () => {
 		assert.equal(lbls.getAddrForFileAndLine(file, 3 - 1), -1);
 	});
 });
+
+
+suite('Labels (z88dk v2 format, sources in several sub directories)', () => {
+	// The C_LINE information contains only the file name ("loop.c"), the
+	// directory is known from the module's .lis file ("game/loop.c").
+	// The C lines of the map file are associated at the end of every .lis
+	// file, also those of the modules of other .lis files.
+	const dir = 'tests/data/labels/projects/z88dk/subdirs_v2';
+	const page = (p: number, addr64k: number) => addr64k + ((p + 1) << 16);
+	let lbls: LabelsClass;
+
+	setup(() => {
+		lbls = new LabelsClass();
+		(WorkspacePaths as any).rootPath = undefined;
+		lbls.readListFiles({
+			z88dkv2: [{
+				path: './' + dir + '/**/*.lis',	// game/loop.c.lis, then menu/menu.c.lis
+				mapFile: './' + dir + '/main.map',
+				srcDirs: [dir],
+				excludeFiles: []
+			}]
+		} as any, new MemoryModelZxNext());
+	});
+
+	test('a module keeps its directory when a later .lis file is parsed', () => {
+		assert.equal(lbls.getAddrForFileAndLine(dir + '/game/loop.c', 5 - 1), page(4, 0x8000));
+		assert.equal(lbls.getAddrForFileAndLine(dir + '/game/loop.c', 10 - 1), page(4, 0x8007));
+		assert.equal(lbls.getSourceFileEntryForAddress(page(4, 0x8007))?.fileName, dir + '/game/loop.c');
+		assert.equal(lbls.getAddrForFileAndLine('loop.c', 10 - 1), -1);	// Not at the root
+	});
+
+	test('the module of the later .lis file', () => {
+		assert.equal(lbls.getAddrForFileAndLine(dir + '/menu/menu.c', 5 - 1), page(4, 0x8010));
+		assert.equal(lbls.getSourceFileEntryForAddress(page(4, 0x8013))?.fileName, dir + '/menu/menu.c');
+	});
+
+	test('a module without .lis file is found in a sub directory', () => {
+		assert.equal(lbls.getAddrForFileAndLine(dir + '/util/extra.c', 3 - 1), page(4, 0x8020));
+		assert.equal(lbls.getSourceFileEntryForAddress(page(4, 0x8020))?.fileName, dir + '/util/extra.c');
+	});
+});
