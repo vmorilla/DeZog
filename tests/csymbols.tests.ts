@@ -139,7 +139,8 @@ suite('C symbol table (z88dk -debug, sdcc)', () => {
 				path: './' + dir + '/*.lis',
 				mapFile: './' + dir + '/probe.map',
 				srcDirs: [dir],
-				excludeFiles: []
+				excludeFiles: [],
+				target: 'zxn'
 			}]
 		} as any, new MemoryModelZxNext());
 	});
