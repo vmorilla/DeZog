@@ -84,14 +84,20 @@ suite('z88dk map file', () => {
 		 * Like readmapFile: __<section>_head lines define the block of a
 		 * section, the other lines are address symbols.
 		 * The warnings are given in checkMappingToTargetMemoryModel.
+		 * @param blockInfo false to simulate a map file of a z88dk older than
+		 * 2026-10-21 (no block information).
 		 */
-		function converter(mm: MemoryModel, lines: string[] = []) {
+		function converter(mm: MemoryModel, lines: string[] = [], blockInfo = true) {
 			const parser = new Z88dkLabelParserV2(mm, new Map(), new Map(), [], new Map(), new Map(), new Map(), [], [], [], issue => warnings.push(issue.message)) as any;
 			parser.config = {mapFile: 'main.map'};
+			if (blockInfo)
+				lines = ['__code_compiler_head = $8000 ; const, public, def, , CODE,', ...lines];
 			for (const line of lines) {
 				const sym = parseMapLine(line)!;
 				const head = /^__(.+)_head$/.exec(sym.name);
 				if (head) {
+					if (!sym.section)
+						continue;	// Older z88dk: no block
 					parser.sectionBlocks.set(head[1], sym.section);
 					if (head[1] === sym.section)
 						parser.blockStarts.set(head[1], sym.value & 0xFFFF);
@@ -158,6 +164,28 @@ suite('z88dk map file', () => {
 			assert.ok(warnings[0].includes('ZX128K and ZX Next'), warnings[0]);
 			assert.equal(convert(line), 0x1045F);
 			assert.equal(warnings.length, 1);
+		});
+
+		test('No block information (older z88dk): 64k, warned once', () => {
+			const lines = [
+				'__code_compiler_head = $8000 ; const, public, def, , ,',
+				'l1 = $14C000 ; addr, local, , m, PAGE_20, m.c:1',
+				'l2 = $0AE010 ; addr, local, , m, BANK_5, m.c:2'
+			];
+			const convert = converter(new MemoryModelZxNext(), lines, false);
+			assert.equal(warnings.length, 1);
+			assert.ok(warnings[0].includes("'l1'"), warnings[0]);
+			assert.ok(warnings[0].includes('2026-10-21'), warnings[0]);
+			// Initial slot banks: page 0 at 0xC000/0xE000
+			assert.equal(convert(lines[1]), page(0, 0xC000));
+			assert.equal(convert(lines[2]), page(1, 0xE010));
+			assert.equal(convert('l = $8010 ; addr, local, , main_c, code_compiler, main.c:3'), page(4, 0x8010));
+			assert.equal(warnings.length, 1);
+		});
+
+		test('No block information, not banked: no warning', () => {
+			converter(new MemoryModelZxNext(), ['l = $8010 ; addr, local, , main_c, code_compiler, main.c:3'], false);
+			assert.deepEqual(warnings, []);
 		});
 
 		test('Memory model without banking: no warning for 64k', () => {

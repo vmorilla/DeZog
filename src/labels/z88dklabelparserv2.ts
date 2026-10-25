@@ -155,6 +155,8 @@ main.asm:
  * section) of each section into the __<section>_head symbols. If the
  * block name contains a bank (e.g. "BANK_0", "PAGE_20") it is used first,
  * see sourceBank.
+ * Without block information (z88dk older than 2026-10-21) the banks are
+ * ignored, i.e. all addresses are 64k addresses.
  * Otherwise the bank of the address is taken in the numbering of the
  * memory model: 8k pages for ZXNEXT (page 20 at 0x14C000), 16k banks
  * for ZX128K (bank 3 at 0x03C000).
@@ -890,8 +892,6 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 	 *    with the same rules as appmake:
 	 *    "BANK_n": 16k bank n, "BANK_n_L"/"BANK_n_H": lower/upper 8k of
 	 *    16k bank n, "PAGE_n": 8k pages starting at page n.
-	 *    Requires a z88dk version that writes the block of each section
-	 *    into the map file.
 	 * 2. Bits 16-23 of the address. z88dk does not tell which numbering was
 	 *    used, so the numbering of the memory model is assumed: 8k pages for
 	 *    ZXNEXT, 16k banks for ZX128K. An even 8k page may span 16k, i.e.
@@ -971,11 +971,19 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 	 *   model (ZX Next or ZX128K).
 	 *   If the page cannot be converted, the bank of the initial slot
 	 *   configuration is used.
+	 * If the map file contains no block information (z88dk older than
+	 * 2026-10-21) all banks are ignored, i.e. the addresses are parsed as
+	 * 64k addresses.
 	 * The map file is already read. All its addresses are checked here, so
 	 * that a warning is given only once (funcConvertBank does not warn).
 	 */
 	protected checkMappingToTargetMemoryModel() {
 		super.checkMappingToTargetMemoryModel();	// Sets funcConvertBank for 64k
+		if (this.sectionBlocks.size === 0) {
+			// Older z88dk: 64k only
+			this.checkNoBlockInfo();
+			return;
+		}
 		const defaultBank = this.funcConvertBank;
 		const memModel = this.memoryModel;
 
@@ -1018,6 +1026,16 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 	 */
 	protected mapAddressSymbols(): Z88dkMapSymbol[] {
 		return [...this.addressSymbols, ...this.cLineSymbols];
+	}
+
+
+	/** Warns (once) if the map file contains banked addresses but no block
+	 * information (z88dk older than 2026-10-21).
+	 */
+	protected checkNoBlockInfo() {
+		const banked = this.mapAddressSymbols().find(sym => sym.value > 0xFFFF);
+		if (banked)
+			this.sendWarning("The map file contains banked addresses (e.g. '" + banked.name + "' = $" + HexFormat.getHexString(banked.value, 6) + ") but no block information of the sections. Banking requires a z88dk from 2026-10-21 or later. The bank information is ignored.", "warning", (this.config as Z88dkConfig).mapFile);
 	}
 
 
