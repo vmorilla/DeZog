@@ -5,7 +5,7 @@ import {WorkspacePaths} from '../misc/workspacepaths';
 import {existsSync, readFileSync} from 'fs';
 import * as fglob from 'fast-glob';
 import {minimatch} from 'minimatch';
-import {AsmConfigBase, Z88dkConfig, Z88dkConfigV2} from '../settings/settings';
+import {AsmConfigBase, Z88dkConfig} from '../settings/settings';
 import {UnifiedPath} from '../misc/unifiedpath';
 import {HexFormat} from '../misc/hexformat';
 import {MemoryModelZx128k} from '../remotes/MemoryModel/zxspectrummemorymodels';
@@ -155,10 +155,10 @@ main.asm:
  * section) of each section into the __<section>_head symbols. If the
  * block name contains a bank (e.g. "BANK_0", "PAGE_20") it is used first,
  * see sourceBank.
- * The bank numbering of the address depends on the z88dk target ('target'
- * setting): 16k banks for "zx" (bank 3 at 0x03C000) or 8k pages for "zxn"
- * (page 20 at 0x14C000). It is converted into the banks of the memory model.
- * For "zxn" the code of an even page may span 16k, i.e. the upper 8k of
+ * Otherwise the bank of the address is taken in the numbering of the
+ * memory model: 8k pages for ZXNEXT (page 20 at 0x14C000), 16k banks
+ * for ZX128K (bank 3 at 0x03C000).
+ * For ZXNEXT the code of an even page may span 16k, i.e. the upper 8k of
  * the 16k block belongs to the next (odd) page, e.g. 0x10E000 is in page 17.
  *
  * Debug information ("-debug"):
@@ -289,8 +289,6 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 	/// The start address (64k) of each block, from the __<block>_head symbols.
 	protected blockStarts = new Map<string, number>();
 
-	/// The banked address warnings already given. To warn only once.
-	protected warnedBanks = new Set<string>();
 
 
 	/** Returns true if the map file contains the "-debug" C line information. */
@@ -891,13 +889,14 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 	 * 1. The name of the block (top level section) the section belongs to,
 	 *    with the same rules as appmake:
 	 *    "BANK_n": 16k bank n, "BANK_n_L"/"BANK_n_H": lower/upper 8k of
-	 *    16k bank n (zxn), "PAGE_n": 8k pages starting at page n (zxn).
+	 *    16k bank n, "PAGE_n": 8k pages starting at page n.
 	 *    Requires a z88dk version that writes the block of each section
 	 *    into the map file.
 	 * 2. Bits 16-23 of the address. z88dk does not tell which numbering was
-	 *    used, so it is taken from the 'target' setting:
-	 *    "zx" uses 16k banks, "zxn" 8k pages. An even 8k page may span 16k,
-	 *    i.e. the upper 8k belongs to the next page.
+	 *    used, so the numbering of the memory model is assumed: 8k pages for
+	 *    ZXNEXT, 16k banks for ZX128K. An even 8k page may span 16k, i.e.
+	 *    the upper 8k belongs to the next page.
+	 *    For other memory models there is no bank information.
 	 * 3. Otherwise (address <= 0xFFFF): no bank information.
 	 * @param value The z88dk address.
 	 * @param section The section of the address.
@@ -905,12 +904,11 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 	protected sourceBank(value: number, section: string): number {
 		const addr64k = value & 0xFFFF;
 		const half = (addr64k >>> 13) & 0x01;	// Lower or upper 8k of a 16k bank
-		const target = (this.config as Z88dkConfigV2).target;
 
 		// Block name
 		const block = this.sectionBlocks.get(section);
 		if (block) {
-			const page = this.blockPage(block, addr64k, target);
+			const page = this.blockPage(block, addr64k);
 			if (page !== undefined)
 				return page + 1;
 		}
@@ -919,11 +917,10 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 		if (value <= 0xFFFF)
 			return 0;
 		const bank = value >>> 16;
-		if (target === 'zxn')
+		if (this.memoryModel instanceof MemoryModelZxNextBase)
 			return (bank | half) + 1;	// Upper 8k of an even page
-		if (target === 'zx')
+		if (this.memoryModel instanceof MemoryModelZx128k)
 			return 2 * bank + half + 1;
-		this.warnBank('no target', "The map file contains banked addresses (e.g. $" + HexFormat.getHexString(value, 6) + ") but 'target' is not set. The bank information is ignored.");
 		return 0;
 	}
 
@@ -931,30 +928,27 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 	/** Returns the ZX Next 8k page of an address from the name of its block.
 	 * See appmake (zx.c, zxn.c): the bank space name ("BANK", "PAGE") may be
 	 * anywhere in the block name, followed by "_<number>".
-	 * "PAGE" and the "_L"/"_H" suffixes are only used for zxn.
 	 * @param block The block name, e.g. "BANK_3" or "PAGE_20".
 	 * @param addr64k The 64k address.
-	 * @param target The 'target' setting.
 	 * @returns The 8k page or undefined if the block name contains no bank.
 	 */
-	protected blockPage(block: string, addr64k: number, target: string | undefined): number | undefined {
-		const zxn = (target !== 'zx');
+	protected blockPage(block: string, addr64k: number): number | undefined {
 		// 16k bank
 		let k = block.indexOf('BANK');
 		if (k >= 0) {
 			const match = /^_(\d+)(?:_([LH]))?/.exec(block.substring(k + 4));
 			if (match) {
 				const bank = parseInt(match[1]);
-				if (zxn && match[2] === 'L')
+				if (match[2] === 'L')
 					return 2 * bank;
-				if (zxn && match[2] === 'H')
+				if (match[2] === 'H')
 					return 2 * bank + 1;
 				return 2 * bank + ((addr64k >>> 13) & 0x01);
 			}
 		}
 		// 8k page. The code of a page continues in the following pages.
 		k = block.indexOf('PAGE');
-		if (zxn && k >= 0) {
+		if (k >= 0) {
 			const match = /^_(\d+)/.exec(block.substring(k + 4));
 			if (match) {
 				const page = parseInt(match[1]);
@@ -975,8 +969,10 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 	 *   memory model.
 	 * - Otherwise the page is converted into the banks of the target memory
 	 *   model (ZX Next or ZX128K).
-	 *   If the page cannot be converted, the bank info is ignored and a
-	 *   warning is given.
+	 *   If the page cannot be converted, the bank of the initial slot
+	 *   configuration is used.
+	 * The map file is already read. All its addresses are checked here, so
+	 * that a warning is given only once (funcConvertBank does not warn).
 	 */
 	protected checkMappingToTargetMemoryModel() {
 		super.checkMappingToTargetMemoryModel();	// Sets funcConvertBank for 64k
@@ -985,48 +981,73 @@ export class Z88dkLabelParserV2 extends LabelParserBase {
 
 		// Conversion of the 8k page into the bank of the target memory model.
 		// Returns undefined if not possible.
-		let convertPage: ((page: number, addr64k: number) => number | undefined) | undefined;
+		let convertPage: (page: number, addr64k: number) => number | undefined;
 		if (memModel instanceof MemoryModelZxNextBase) {
-			convertPage = (page) => page;
+			convertPage = (page, addr64k) => {
+				const slot = memModel.slotRanges[memModel.slotAddress64kAssociation[addr64k]];
+				return slot.banks.has(page) ? page : undefined;
+			};
 		}
 		else if (memModel instanceof MemoryModelZx128k) {
 			convertPage = (page, addr64k) => {
 				if ((page & 0x01) !== ((addr64k >>> 13) & 0x01))
 					return undefined;	// Odd page in the lower 8k of a 16k bank or vice versa
-				return page >>> 1;
+				const bank = page >>> 1;
+				const slot = memModel.slotRanges[memModel.slotAddress64kAssociation[addr64k]];
+				return slot.banks.has(bank) ? bank : undefined;
 			};
 		}
+		else {
+			// No banking
+			this.checkBanksNotUsed();
+			return;
+		}
+
+		this.checkPagesConvertible(convertPage);
 
 		this.funcConvertBank = (addr64k: number, bank: number) => {
 			if (bank === 0)
 				return defaultBank(addr64k, 0);
-			const page = bank - 1;
-			if (!convertPage) {
-				this.warnBank('memory model', "Banked addresses (e.g. page " + page + " at $" + HexFormat.getHexString(addr64k, 4) + ") are only supported for the ZX128K and ZX Next memory models. The bank information is ignored.");
-				return defaultBank(addr64k, 0);
-			}
-			const convBank = convertPage(page, addr64k);
-			const slot = memModel.slotRanges[memModel.slotAddress64kAssociation[addr64k]];
-			if (convBank === undefined || !slot.banks.has(convBank)) {
-				this.warnBank('page ' + page, "Page " + page + " (8k) at $" + HexFormat.getHexString(addr64k, 4) + " cannot be converted to a bank of the memory model at that address. The bank information is ignored.");
-				return defaultBank(addr64k, 0);
-			}
-			return convBank;
+			return convertPage(bank - 1, addr64k) ?? defaultBank(addr64k, 0);
 		};
 	}
 
 
-	/** Warns about a banked address that cannot be converted.
-	 * Each warning (key) is given only once.
-	 * @param key Identifies the warning.
-	 * @param message The warning text.
+	/** Returns the symbols of the map file that have an address
+	 * (labels and C lines).
 	 */
-	protected warnBank(key: string, message: string) {
-		const mapFile = (this.config as Z88dkConfigV2).mapFile;
-		key = mapFile + ':' + key;
-		if (this.warnedBanks.has(key))
-			return;
-		this.warnedBanks.add(key);
-		this.sendWarning(message, "warning", mapFile);
+	protected mapAddressSymbols(): Z88dkMapSymbol[] {
+		return [...this.addressSymbols, ...this.cLineSymbols];
+	}
+
+
+	/** Warns (once) if the map file contains banked addresses although the
+	 * memory model has no banking (i.e. is neither ZX128K nor ZX Next).
+	 */
+	protected checkBanksNotUsed() {
+		const banked = this.mapAddressSymbols().find(sym => sym.value > 0xFFFF
+			|| this.blockPage(this.sectionBlocks.get(sym.section) ?? '', sym.value & 0xFFFF) !== undefined);
+		if (banked)
+			this.sendWarning("Banked addresses (e.g. '" + banked.name + "' in section '" + banked.section + "') are only supported for the ZX128K and ZX Next memory models. The bank information is ignored.", "warning", (this.config as Z88dkConfig).mapFile);
+	}
+
+
+	/** Warns (once per page) about pages of the map file that cannot be
+	 * converted to a bank of the memory model.
+	 * @param convertPage The conversion of a page into the memory model bank.
+	 */
+	protected checkPagesConvertible(convertPage: (page: number, addr64k: number) => number | undefined) {
+		const warned = new Set<number>();
+		for (const sym of this.mapAddressSymbols()) {
+			const bank = this.sourceBank(sym.value, sym.section);
+			if (bank === 0)
+				continue;
+			const page = bank - 1;
+			const addr64k = sym.value & 0xFFFF;
+			if (warned.has(page) || convertPage(page, addr64k) !== undefined)
+				continue;
+			warned.add(page);
+			this.sendWarning("Page " + page + " (8k) of '" + sym.name + "' (section '" + sym.section + "') cannot be converted to a bank of the memory model at $" + HexFormat.getHexString(addr64k, 4) + ". The bank information is ignored.", "warning", (this.config as Z88dkConfig).mapFile);
+		}
 	}
 }

@@ -23,15 +23,14 @@ suite('Labels (z88dk v2 banking projects)', () => {
 	});
 
 	/** Reads the list and map files of a project. */
-	function read(project: string, memModel: MemoryModel, target: 'zx' | 'zxn', lisGlob: string) {
+	function read(project: string, memModel: MemoryModel, lisGlob: string) {
 		dir = base + project;
 		lbls.readListFiles({
 			z88dkv2: [{
 				path: './' + dir + '/' + lisGlob,
 				mapFile: './' + dir + '/main.map',
 				srcDirs: [dir],
-				excludeFiles: [],
-				target
+				excludeFiles: []
 			}]
 		} as any, memModel);
 	}
@@ -45,7 +44,7 @@ suite('Labels (z88dk v2 banking projects)', () => {
 	suite('asm', () => {
 		test('zx48', () => {
 			const mm = new MemoryModelZx48k();
-			read('asm_zx48', mm, 'zx', 'main.lis');
+			read('asm_zx48', mm, 'main.lis');
 			// No banking: the bank of the slot
 			const longMain = lbls.getNumberForLabel('_main')!;
 			assert.equal(longMain & 0xFFFF, 0x8000);
@@ -56,7 +55,7 @@ suite('Labels (z88dk v2 banking projects)', () => {
 		});
 
 		test('zx128', () => {
-			read('asm_zx128', new MemoryModelZx128k(), 'zx', 'main.lis');
+			read('asm_zx128', new MemoryModelZx128k(), 'main.lis');
 			// CODE: no bank prefix, 16 bit: default (bank 2 at 0x8000)
 			assert.equal(lbls.getNumberForLabel('_main'), page(2, 0x8000));
 			// BANK_3 with 16 bit ORG
@@ -68,7 +67,7 @@ suite('Labels (z88dk v2 banking projects)', () => {
 		});
 
 		test('zxn', () => {
-			read('asm_zxn', new MemoryModelZxNext(), 'zxn', 'main.lis');
+			read('asm_zxn', new MemoryModelZxNext(), 'main.lis');
 			// CODE: default (page 11 at 0x6000)
 			assert.equal(lbls.getNumberForLabel('_main'), page(11, 0x6000));
 			// BANK_0 at 0x8000: page 0, not the default page 4
@@ -90,7 +89,7 @@ suite('Labels (z88dk v2 banking projects)', () => {
 	suite('C', () => {
 		test('zx48', () => {
 			const mm = new MemoryModelZx48k();
-			read('c_zx48', mm, 'zx', '*.c.lis');
+			read('c_zx48', mm, '*.c.lis');
 			const bank = mm.initialSlots[mm.slotAddress64kAssociation[0x8000]];
 			assert.equal(lbls.getNumberForLabel('_main'), page(bank, 0x8C48));
 			assert.equal(lbls.getNumberForLabel('_banked_fn'), page(bank, 0x8C51));
@@ -98,7 +97,7 @@ suite('Labels (z88dk v2 banking projects)', () => {
 		});
 
 		test('zx128', () => {
-			read('c_zx128', new MemoryModelZx128k(), 'zx', '*.c.lis');
+			read('c_zx128', new MemoryModelZx128k(), '*.c.lis');
 			assert.equal(lbls.getNumberForLabel('_main'), page(2, 0x8C48));
 			// --codesegBANK_6, 16 bit address $C000
 			assert.equal(lbls.getNumberForLabel('_banked_fn'), page(6, 0xC000));
@@ -110,7 +109,7 @@ suite('Labels (z88dk v2 banking projects)', () => {
 		});
 
 		test('zxn', () => {
-			read('c_zxn', new MemoryModelZxNext(), 'zxn', '*.c.lis');
+			read('c_zxn', new MemoryModelZxNext(), '*.c.lis');
 			assert.equal(lbls.getNumberForLabel('_main'), page(4, 0x8C48));
 			// --codesegPAGE_20, 16 bit address $C000
 			assert.equal(lbls.getNumberForLabel('_banked_fn'), page(20, 0xC000));
